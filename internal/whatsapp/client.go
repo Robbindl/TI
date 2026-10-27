@@ -19,9 +19,11 @@ import (
 	"github.com/mdp/qrterminal/v3"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/appstate"
+	"go.mau.fi/whatsmeow/proto/waCompanionReg"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/proto/waSyncAction"
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -70,6 +72,10 @@ func New(selects *selection.Store) *Client {
 }
 
 func (c *Client) Run(ctx context.Context, onMessage func(Message) error, onConnected func()) error {
+	windowsOS := "Windows"
+	store.DeviceProps.Os = &windowsOS
+	store.DeviceProps.PlatformType = waCompanionReg.DeviceProps_DESKTOP.Enum()
+
 	defer func() {
 		files, _ := filepath.Glob(filepath.Join("data", "whatsapp-link-qr-*.png"))
 		for _, file := range files {
