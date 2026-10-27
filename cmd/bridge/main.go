@@ -85,7 +85,7 @@ func runBridge(parent context.Context) error {
 		return wa.ContactsContacted(ctx, from, until)
 	}, func(ctx context.Context, from, until time.Time) ([]history.Contact, error) {
 		return wa.ContactsMessagedByMe(ctx, from, until)
-	}, func(ctx context.Context, from, until time.Time) ([]history.CallContact, error) {
+	}, wa.RefreshCallHistory, func(ctx context.Context, from, until time.Time) ([]history.CallContact, error) {
 		return wa.CallsContacted(ctx, from, until)
 	})
 	go func() {

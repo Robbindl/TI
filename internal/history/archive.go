@@ -297,8 +297,7 @@ func (a *Archive) contactsByDirection(ctx context.Context, from, until time.Time
 		)`
 	if fromMe {
 		nameExpr = `COALESCE(
-			NULLIF(CASE WHEN chat_name NOT IN ('', 'Unknown chat', 'Unknown private chat') AND instr(chat_name, '@') = 0 THEN chat_name END, ''),
-			NULLIF(CASE WHEN sender_name NOT IN ('', 'Unknown sender', 'Unknown chat', 'Unknown private chat') AND instr(sender_name, '@') = 0 THEN sender_name END, ''),
+			NULLIF(CASE WHEN chat_name NOT IN ('', 'Unknown sender', 'Unknown chat', 'Unknown private chat', 'You') AND instr(chat_name, '@') = 0 THEN chat_name END, ''),
 			chat_jid
 		)`
 	}

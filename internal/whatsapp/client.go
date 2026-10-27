@@ -601,6 +601,13 @@ func (c *Client) CallsContacted(ctx context.Context, from, until time.Time) ([]h
 	return callers, nil
 }
 
+func (c *Client) RefreshCallHistory(ctx context.Context) error {
+	if c.client == nil {
+		return fmt.Errorf("WhatsApp client is not ready for call history sync")
+	}
+	return c.client.FetchAppState(ctx, appstate.WAPatchRegular, false, false)
+}
+
 func (c *Client) reportContactName(ctx context.Context, jidString, archivedName string) string {
 	jid, err := types.ParseJID(jidString)
 	if err != nil {
@@ -966,7 +973,7 @@ func (c *Client) resolveChat(ctx context.Context, jid types.JID, preferredName s
 
 func isUsableContactName(name string, jid types.JID) bool {
 	name = strings.TrimSpace(name)
-	return name != "" && name != "Unknown chat" && name != "Unknown private chat" && name != "Unknown sender" && name != jid.String() && name != jid.User && !strings.Contains(name, "@")
+	return name != "" && name != "You" && name != "Unknown chat" && name != "Unknown private chat" && name != "Unknown sender" && name != jid.String() && name != jid.User && !strings.Contains(name, "@")
 }
 
 func (c *Client) PrintChats() {

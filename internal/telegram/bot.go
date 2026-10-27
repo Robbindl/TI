@@ -44,24 +44,25 @@ type ForwardedMessage struct {
 }
 
 type Bot struct {
-	token            string
-	ownerID          int64
-	selection        *selection.Store
-	chats            func() []Chat
-	refresh          func(context.Context) error
-	setSince         func(context.Context, string, string) (int, error)
-	replayRange      func(context.Context, string, string, string, history.ReplayProgress) (history.ReplayResult, error)
-	contactRange     func(context.Context, time.Time, time.Time) ([]history.Contact, error)
-	sentContactRange func(context.Context, time.Time, time.Time) ([]history.Contact, error)
-	callRange        func(context.Context, time.Time, time.Time) ([]history.CallContact, error)
-	http             *http.Client
-	pendingJID       string
-	pendingPage      int
-	pendingRange     bool
-	pendingContacts  bool
-	pendingFrom      string
-	historyMu        sync.Mutex
-	historyBusy      bool
+	token              string
+	ownerID            int64
+	selection          *selection.Store
+	chats              func() []Chat
+	refresh            func(context.Context) error
+	setSince           func(context.Context, string, string) (int, error)
+	replayRange        func(context.Context, string, string, string, history.ReplayProgress) (history.ReplayResult, error)
+	contactRange       func(context.Context, time.Time, time.Time) ([]history.Contact, error)
+	sentContactRange   func(context.Context, time.Time, time.Time) ([]history.Contact, error)
+	refreshCallHistory func(context.Context) error
+	callRange          func(context.Context, time.Time, time.Time) ([]history.CallContact, error)
+	http               *http.Client
+	pendingJID         string
+	pendingPage        int
+	pendingRange       bool
+	pendingContacts    bool
+	pendingFrom        string
+	historyMu          sync.Mutex
+	historyBusy        bool
 }
 
 type update struct {
@@ -106,19 +107,20 @@ type apiResponse struct {
 	} `json:"parameters"`
 }
 
-func New(token string, ownerID int64, store *selection.Store, chats func() []Chat, refresh func(context.Context) error, setSince func(context.Context, string, string) (int, error), replayRange func(context.Context, string, string, string, history.ReplayProgress) (history.ReplayResult, error), contactRange func(context.Context, time.Time, time.Time) ([]history.Contact, error), sentContactRange func(context.Context, time.Time, time.Time) ([]history.Contact, error), callRange func(context.Context, time.Time, time.Time) ([]history.CallContact, error)) *Bot {
+func New(token string, ownerID int64, store *selection.Store, chats func() []Chat, refresh func(context.Context) error, setSince func(context.Context, string, string) (int, error), replayRange func(context.Context, string, string, string, history.ReplayProgress) (history.ReplayResult, error), contactRange func(context.Context, time.Time, time.Time) ([]history.Contact, error), sentContactRange func(context.Context, time.Time, time.Time) ([]history.Contact, error), refreshCallHistory func(context.Context) error, callRange func(context.Context, time.Time, time.Time) ([]history.CallContact, error)) *Bot {
 	return &Bot{
-		token:            token,
-		ownerID:          ownerID,
-		selection:        store,
-		chats:            chats,
-		refresh:          refresh,
-		setSince:         setSince,
-		replayRange:      replayRange,
-		contactRange:     contactRange,
-		sentContactRange: sentContactRange,
-		callRange:        callRange,
-		http:             &http.Client{Timeout: 65 * time.Second},
+		token:              token,
+		ownerID:            ownerID,
+		selection:          store,
+		chats:              chats,
+		refresh:            refresh,
+		setSince:           setSince,
+		replayRange:        replayRange,
+		contactRange:       contactRange,
+		sentContactRange:   sentContactRange,
+		refreshCallHistory: refreshCallHistory,
+		callRange:          callRange,
+		http:               &http.Client{Timeout: 65 * time.Second},
 	}
 }
 
@@ -469,7 +471,7 @@ func (b *Bot) runContactReport(ctx context.Context, fromDate, toDate string) {
 	var contacts []history.Contact
 	var sentContacts []history.Contact
 	var calls []history.CallContact
-	var contactErr, sentContactErr, callErr error
+	var contactErr, sentContactErr, callRefreshErr, callErr error
 	if b.contactRange != nil {
 		contacts, contactErr = b.contactRange(ctx, from, until)
 	} else {
@@ -481,6 +483,9 @@ func (b *Bot) runContactReport(ctx context.Context, fromDate, toDate string) {
 		sentContactErr = fmt.Errorf("sent message contact reports are unavailable")
 	}
 	if b.callRange != nil {
+		if b.refreshCallHistory != nil {
+			callRefreshErr = b.refreshCallHistory(ctx)
+		}
 		calls, callErr = b.callRange(ctx, from, until)
 	} else {
 		callErr = fmt.Errorf("call history reports are unavailable")
@@ -514,10 +519,13 @@ func (b *Bot) runContactReport(ctx context.Context, fromDate, toDate string) {
 		}
 	}
 	report.WriteString("\nPeople who called you:\n")
+	if callRefreshErr != nil {
+		fmt.Fprintf(&report, "Could not refresh call history from WhatsApp; showing saved records only: %s\n", callRefreshErr)
+	}
 	if callErr != nil {
 		fmt.Fprintf(&report, "Could not read call history: %s\n", callErr)
 	} else if len(calls) == 0 {
-		report.WriteString("No incoming individual call records were synced from WhatsApp for this range.\n")
+		report.WriteString("No incoming individual call records are saved for this range.\n")
 	} else {
 		for _, call := range calls {
 			name := strings.ReplaceAll(strings.ReplaceAll(call.Name, "\r", " "), "\n", " ")
