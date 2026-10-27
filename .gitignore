@@ -1,0 +1,11 @@
+.env
+.env.*
+!.env.example
+/data/
+/config.json
+/wa-telegram-bridge.exe
+/wa-telegram-bridge
+*.exe
+*.exe~
+*.test
+*.out
