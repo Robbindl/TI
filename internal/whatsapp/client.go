@@ -147,14 +147,14 @@ func (c *Client) Run(ctx context.Context, onMessage func(Message) error, onConne
 			c.updateCallStatus(ctx, event.CallID, "rejected")
 		case *events.AppState:
 			if event.CallLogAction != nil {
-				c.recordSyncedIncomingCall(ctx, event.CallLogAction.GetCallLogRecord(), event.Index)
+				c.recordSyncedCall(ctx, event.CallLogAction.GetCallLogRecord(), event.Index, client)
 			}
 		case *events.HistorySync:
 			if event.Data == nil {
 				return
 			}
 			for _, call := range event.Data.GetCallLogRecords() {
-				c.recordSyncedIncomingCall(ctx, call, nil)
+				c.recordSyncedCall(ctx, call, nil, client)
 			}
 			conversationCount := 0
 			archivedCount := 0
@@ -235,6 +235,7 @@ func (c *Client) Run(ctx context.Context, onMessage func(Message) error, onConne
 			if isPrivateChat(event.Info.Chat) {
 				c.rememberChat(chatJID, name)
 			}
+			contentMessage, _ := editedContentMessage(event.Message)
 			text := messageText(event)
 			if text == "" {
 				return
@@ -258,8 +259,8 @@ func (c *Client) Run(ctx context.Context, onMessage func(Message) error, onConne
 			if onMessage != nil {
 				enabled, allowed := c.shouldForward(message)
 				if enabled && allowed {
-					if mediaKind := mediaKind(event.Message); mediaKind != "" {
-						mediaData, err := client.DownloadAny(ctx, event.Message)
+					if mediaKind := mediaKind(contentMessage); mediaKind != "" {
+						mediaData, err := client.DownloadAny(ctx, contentMessage)
 						if err != nil {
 							fmt.Printf("Could not download %s from %s: %v\n", mediaKind, chatJID, err)
 							if message.Text == "" {
@@ -273,7 +274,7 @@ func (c *Client) Run(ctx context.Context, onMessage func(Message) error, onConne
 						} else {
 							message.MediaKind = mediaKind
 							message.MediaData = mediaData
-							message.MediaMIME = mediaMIME(event.Message)
+							message.MediaMIME = mediaMIME(contentMessage)
 							message.MediaName = mediaFileName(mediaKind, message.MediaMIME)
 						}
 					}
@@ -605,6 +606,8 @@ func (c *Client) RefreshCallHistory(ctx context.Context) error {
 	if c.client == nil {
 		return fmt.Errorf("WhatsApp client is not ready for call history sync")
 	}
+	c.callHistorySyncMu.Lock()
+	defer c.callHistorySyncMu.Unlock()
 	return c.client.FetchAppState(ctx, appstate.WAPatchRegular, false, false)
 }
 
@@ -653,7 +656,7 @@ func (c *Client) syncCallHistory(ctx context.Context, client *whatsmeow.Client) 
 	if c.callHistorySynced {
 		return
 	}
-	marker := filepath.Join("data", "call-history-sync.done")
+	marker := filepath.Join("data", "call-history-sync-v2.done")
 	if _, err := os.Stat(marker); err == nil {
 		c.callHistorySynced = true
 		return
@@ -675,15 +678,40 @@ func (c *Client) syncCallHistory(ctx context.Context, client *whatsmeow.Client) 
 	log.Println("WhatsApp call history sync completed.")
 }
 
-func (c *Client) recordSyncedIncomingCall(ctx context.Context, record *waSyncAction.CallLogRecord, index []string) {
-	if c.archive == nil || record == nil {
+func (c *Client) recordSyncedCall(ctx context.Context, record *waSyncAction.CallLogRecord, index []string, client *whatsmeow.Client) {
+	if c.archive == nil || record == nil || record.IsIncoming == nil {
 		return
 	}
-	if record.IsIncoming == nil || !record.GetIsIncoming() || record.GetGroupJID() != "" {
+	if record.GetGroupJID() != "" {
 		return
 	}
+	direction := history.CallDirectionIncoming
 	caller, err := types.ParseJID(record.GetCallCreatorJID())
-	if err != nil || !isPrivateChat(caller) {
+	if !record.GetIsIncoming() {
+		direction = history.CallDirectionOutgoing
+		caller = types.JID{}
+		var self types.JID
+		if client != nil && client.Store != nil && client.Store.ID != nil {
+			self = client.Store.ID.ToNonAD()
+		}
+		for _, participant := range record.GetParticipants() {
+			candidate, parseErr := types.ParseJID(participant.GetUserJID())
+			if parseErr != nil || !isPrivateChat(candidate) || isOwnCallParticipant(ctx, client, candidate) {
+				continue
+			}
+			caller = candidate
+			break
+		}
+		if caller.IsEmpty() && err == nil {
+			creator, parseErr := types.ParseJID(record.GetCallCreatorJID())
+			if parseErr == nil && (self.IsEmpty() || creator.ToNonAD() != self) && !isOwnCallParticipant(ctx, client, creator) {
+				caller = creator
+			}
+		}
+	} else if err != nil || !isPrivateChat(caller) {
+		return
+	}
+	if caller.IsEmpty() || !isPrivateChat(caller) {
 		return
 	}
 	startTime := record.GetStartTime()
@@ -705,11 +733,29 @@ func (c *Client) recordSyncedIncomingCall(ctx context.Context, record *waSyncAct
 	}
 	caller, name := c.resolveChat(ctx, caller, "")
 	status := syncedCallStatus(record.GetCallResult())
-	if err := c.archive.SaveIncomingCall(ctx, history.CallRecord{
-		CallID: callID, CallerJID: caller.String(), CallerName: name, Timestamp: timestamp, Status: status,
+	if err := c.archive.SaveCall(ctx, history.CallRecord{
+		CallID: callID, CallerJID: caller.String(), CallerName: name, Timestamp: timestamp, Status: status, Direction: direction,
 	}); err != nil {
 		log.Printf("Could not archive synced WhatsApp call: %v", err)
 	}
+}
+
+func isOwnCallParticipant(ctx context.Context, client *whatsmeow.Client, jid types.JID) bool {
+	if client == nil || client.Store == nil {
+		return false
+	}
+	if client.Store.ID != nil && jid.ToNonAD() == client.Store.ID.ToNonAD() {
+		return true
+	}
+	if !client.Store.LID.IsEmpty() && jid.ToNonAD() == client.Store.LID.ToNonAD() {
+		return true
+	}
+	if jid.Server == types.HiddenUserServer && client.Store.ID != nil {
+		if phoneJID, err := client.Store.LIDs.GetPNForLID(ctx, jid); err == nil && phoneJID.ToNonAD() == client.Store.ID.ToNonAD() {
+			return true
+		}
+	}
+	return false
 }
 
 func syncedCallStatus(result waSyncAction.CallLogRecord_CallResult) string {
@@ -997,7 +1043,41 @@ func (c *Client) chatName(jid string) string {
 }
 
 func messageText(event *events.Message) string {
-	message := event.Message
+	message, edited := editedContentMessage(event.Message)
+	edited = edited || event.IsEdit
+	if message == nil {
+		return ""
+	}
+	text := messageContentText(message)
+	if edited {
+		if text == "" {
+			return ""
+		}
+		return "✏️ Edited: " + text
+	}
+	if text != "" {
+		return text
+	}
+	if event.Info.Type != "" {
+		return "[" + event.Info.Type + " message]"
+	}
+	return ""
+}
+
+func editedContentMessage(message *waE2E.Message) (*waE2E.Message, bool) {
+	if message == nil {
+		return nil, false
+	}
+	if protocol := message.GetProtocolMessage(); protocol != nil && protocol.GetType() == waE2E.ProtocolMessage_MESSAGE_EDIT {
+		return protocol.GetEditedMessage(), true
+	}
+	if edited := message.GetEditedMessage().GetMessage(); edited != nil {
+		return edited, true
+	}
+	return message, false
+}
+
+func messageContentText(message *waE2E.Message) string {
 	if message == nil {
 		return ""
 	}
@@ -1018,9 +1098,6 @@ func messageText(event *events.Message) string {
 	}
 	if kind := mediaKind(message); kind != "" {
 		return "[" + kind + " message]"
-	}
-	if event.Info.Type != "" {
-		return "[" + event.Info.Type + " message]"
 	}
 	return ""
 }

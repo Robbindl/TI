@@ -50,6 +50,7 @@ type CallRecord struct {
 	CallerName string
 	Timestamp  time.Time
 	Status     string
+	Direction  string
 }
 
 type CallContact struct {
@@ -58,7 +59,13 @@ type CallContact struct {
 	CallCount int
 	LastCall  time.Time
 	LastState string
+	Direction string
 }
+
+const (
+	CallDirectionIncoming = "incoming"
+	CallDirectionOutgoing = "outgoing"
+)
 
 type Archive struct {
 	mu sync.Mutex
@@ -116,8 +123,13 @@ func Open(path string) (*Archive, error) {
 		caller_jid TEXT NOT NULL,
 		caller_name TEXT NOT NULL,
 		timestamp_unix INTEGER NOT NULL,
-		status TEXT NOT NULL DEFAULT 'offered'
+		status TEXT NOT NULL DEFAULT 'offered',
+		direction TEXT NOT NULL DEFAULT 'incoming'
 	)`); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := ensureCallHistoryDirection(db); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -126,6 +138,36 @@ func Open(path string) (*Archive, error) {
 		return nil, err
 	}
 	return &Archive{db: db}, nil
+}
+
+func ensureCallHistoryDirection(db *sql.DB) error {
+	rows, err := db.Query(`PRAGMA table_info(call_history)`)
+	if err != nil {
+		return err
+	}
+	found := false
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if name == "direction" {
+			found = true
+		}
+	}
+	rowsErr := rows.Err()
+	_ = rows.Close()
+	if rowsErr != nil {
+		return rowsErr
+	}
+	if found {
+		return nil
+	}
+	_, err = db.Exec(`ALTER TABLE call_history ADD COLUMN direction TEXT NOT NULL DEFAULT 'incoming'`)
+	return err
 }
 
 func ensureColumn(db *sql.DB, name, declaration string) error {
@@ -332,6 +374,11 @@ func (a *Archive) contactsByDirection(ctx context.Context, from, until time.Time
 }
 
 func (a *Archive) SaveIncomingCall(ctx context.Context, call CallRecord) error {
+	call.Direction = CallDirectionIncoming
+	return a.SaveCall(ctx, call)
+}
+
+func (a *Archive) SaveCall(ctx context.Context, call CallRecord) error {
 	if call.CallID == "" || call.CallerJID == "" || call.Timestamp.IsZero() {
 		return fmt.Errorf("call ID, caller, and timestamp are required")
 	}
@@ -341,16 +388,20 @@ func (a *Archive) SaveIncomingCall(ctx context.Context, call CallRecord) error {
 	if call.Status == "" {
 		call.Status = "offered"
 	}
+	if call.Direction != CallDirectionOutgoing {
+		call.Direction = CallDirectionIncoming
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	_, err := a.db.ExecContext(ctx, `INSERT INTO call_history (call_id, caller_jid, caller_name, timestamp_unix, status)
-		VALUES (?, ?, ?, ?, ?)
+	_, err := a.db.ExecContext(ctx, `INSERT INTO call_history (call_id, caller_jid, caller_name, timestamp_unix, status, direction)
+		VALUES (?, ?, ?, ?, ?, ?)
 		ON CONFLICT(call_id) DO UPDATE SET
 		caller_jid=excluded.caller_jid,
 		caller_name=CASE WHEN excluded.caller_name='' THEN call_history.caller_name ELSE excluded.caller_name END,
 		timestamp_unix=excluded.timestamp_unix,
-		status=excluded.status`,
-		call.CallID, call.CallerJID, call.CallerName, call.Timestamp.Unix(), call.Status)
+		status=excluded.status,
+		direction=excluded.direction`,
+		call.CallID, call.CallerJID, call.CallerName, call.Timestamp.Unix(), call.Status, call.Direction)
 	return err
 }
 
@@ -372,21 +423,22 @@ func (a *Archive) CallsContacted(ctx context.Context, from, until time.Time) ([]
 	defer a.mu.Unlock()
 	rows, err := a.db.QueryContext(ctx, `WITH ranked_calls AS (
 		SELECT caller_jid,
+			direction,
 			COALESCE(
 				NULLIF(CASE WHEN caller_name NOT IN ('', 'Unknown chat', 'Unknown private chat', 'Unknown sender') AND instr(caller_name, '@') = 0 THEN caller_name END, ''),
 				caller_jid
 			) AS caller_name,
 			timestamp_unix,
 			status,
-			COUNT(*) OVER (PARTITION BY caller_jid) AS call_count,
-			ROW_NUMBER() OVER (PARTITION BY caller_jid ORDER BY timestamp_unix DESC, call_id DESC) AS row_number
+			COUNT(*) OVER (PARTITION BY caller_jid, direction) AS call_count,
+			ROW_NUMBER() OVER (PARTITION BY caller_jid, direction ORDER BY timestamp_unix DESC, call_id DESC) AS row_number
 		FROM call_history
 		WHERE timestamp_unix >= ? AND timestamp_unix < ?
 			AND (caller_jid GLOB '*@s.whatsapp.net' OR caller_jid GLOB '*@lid' OR caller_jid GLOB '*@c.us')
 	)
-	SELECT caller_jid, caller_name, call_count, timestamp_unix, status
+	SELECT caller_jid, caller_name, call_count, timestamp_unix, status, direction
 	FROM ranked_calls WHERE row_number = 1
-	ORDER BY timestamp_unix DESC, caller_name COLLATE NOCASE`, from.Unix(), until.Unix())
+	ORDER BY direction, timestamp_unix DESC, caller_name COLLATE NOCASE`, from.Unix(), until.Unix())
 	if err != nil {
 		return nil, err
 	}
@@ -395,7 +447,7 @@ func (a *Archive) CallsContacted(ctx context.Context, from, until time.Time) ([]
 	for rows.Next() {
 		var caller CallContact
 		var lastCall int64
-		if err := rows.Scan(&caller.JID, &caller.Name, &caller.CallCount, &lastCall, &caller.LastState); err != nil {
+		if err := rows.Scan(&caller.JID, &caller.Name, &caller.CallCount, &lastCall, &caller.LastState, &caller.Direction); err != nil {
 			return nil, err
 		}
 		caller.LastCall = time.Unix(lastCall, 0)

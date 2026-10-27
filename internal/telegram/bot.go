@@ -363,7 +363,7 @@ func (b *Bot) handleUpdate(ctx context.Context, item update) {
 		}
 		switch strings.SplitN(command[0], "@", 2)[0] {
 		case "/start", "/help":
-			_ = b.sendText(ctx, b.ownerID, "WhatsApp bridge is ready. Use /chats to choose forwarding chats, or /contacts to see who messaged you, you messaged, or called during a date range.", inlineKeyboard{})
+			_ = b.sendText(ctx, b.ownerID, "WhatsApp bridge is ready. Use /chats to choose forwarding chats, or /contacts to see who messaged you, you messaged, called you, or you called during a date range.", inlineKeyboard{})
 		case "/chats":
 			if b.refresh != nil {
 				refreshCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
@@ -518,18 +518,33 @@ func (b *Bot) runContactReport(ctx context.Context, fromDate, toDate string) {
 			fmt.Fprintf(&report, "• %s — %d message(s), last %s\n", name, contact.MessageCount, contact.LastContact.In(timezone.Kenya).Format("2006-01-02 15:04"))
 		}
 	}
-	report.WriteString("\nPeople who called you:\n")
 	if callRefreshErr != nil {
 		fmt.Fprintf(&report, "Could not refresh call history from WhatsApp; showing saved records only: %s\n", callRefreshErr)
 	}
 	if callErr != nil {
 		fmt.Fprintf(&report, "Could not read call history: %s\n", callErr)
-	} else if len(calls) == 0 {
-		report.WriteString("No incoming individual call records are saved for this range.\n")
 	} else {
-		for _, call := range calls {
-			name := strings.ReplaceAll(strings.ReplaceAll(call.Name, "\r", " "), "\n", " ")
-			fmt.Fprintf(&report, "• %s — %d call(s), last %s, status %s\n", name, call.CallCount, call.LastCall.In(timezone.Kenya).Format("2006-01-02 15:04"), call.LastState)
+		for _, section := range []struct {
+			direction string
+			heading   string
+			empty     string
+		}{
+			{history.CallDirectionIncoming, "People who called you:", "No incoming individual call records are saved for this range."},
+			{history.CallDirectionOutgoing, "People you called:", "No outgoing individual call records are saved for this range."},
+		} {
+			report.WriteString("\n" + section.heading + "\n")
+			found := false
+			for _, call := range calls {
+				if call.Direction != section.direction {
+					continue
+				}
+				found = true
+				name := strings.ReplaceAll(strings.ReplaceAll(call.Name, "\r", " "), "\n", " ")
+				fmt.Fprintf(&report, "• %s — %d call(s), last %s, status %s\n", name, call.CallCount, call.LastCall.In(timezone.Kenya).Format("2006-01-02 15:04"), call.LastState)
+			}
+			if !found {
+				report.WriteString(section.empty + "\n")
+			}
 		}
 	}
 	if err := b.sendLongText(ctx, report.String()); err != nil {
@@ -542,7 +557,7 @@ func (b *Bot) showContactOptions(ctx context.Context, chatID int64) {
 		{Text: "Today", CallbackData: "contacts_today"},
 		{Text: "Choose date range", CallbackData: "contacts_range"},
 	}}}
-	_ = b.sendText(ctx, chatID, "Show who messaged you, you messaged, or called:", keyboard)
+	_ = b.sendText(ctx, chatID, "Show who messaged you, you messaged, called you, or you called:", keyboard)
 }
 
 func (b *Bot) runHistoryRange(ctx context.Context, jid, fromDate, toDate string, page int) {
@@ -618,7 +633,7 @@ func (b *Bot) showChats(ctx context.Context, chatID, messageID int64, page int) 
 	if len(navigation) > 0 {
 		keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, navigation)
 	}
-	text := fmt.Sprintf("Forwarding selection (%d chats, page %d/%d):\nON/OFF controls live forwarding. Since sets a forwarding cutoff. History range sends an inclusive date range again whenever requested. Contact reports list people with incoming messages in the selected dates.", len(chats), page+1, totalPages)
+	text := fmt.Sprintf("Forwarding selection (%d chats, page %d/%d):\nON/OFF controls live forwarding. Since sets a forwarding cutoff. History range sends an inclusive date range again whenever requested. Contact reports list people who messaged or called in either direction during the selected dates.", len(chats), page+1, totalPages)
 	if messageID == 0 {
 		_ = b.sendText(ctx, chatID, text, keyboard)
 		return
