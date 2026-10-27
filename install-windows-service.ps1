@@ -47,6 +47,14 @@ function Build-Bridge {
     }
 }
 
+function Stop-BridgeServiceIfPresent {
+    $ExistingService = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    if ($null -ne $ExistingService -and $ExistingService.Status -ne "Stopped") {
+        Stop-Service -Name $ServiceName -Force
+        $ExistingService.WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Stopped, [TimeSpan]::FromSeconds(30))
+    }
+}
+
 function Import-EnvironmentFile {
     Get-Content $EnvironmentPath | ForEach-Object {
         $line = $_.Trim()
@@ -78,8 +86,8 @@ switch ($Action) {
     }
     "pair" {
         Ensure-EnvironmentFile
+        Stop-BridgeServiceIfPresent
         Build-Bridge
-        & sc.exe stop $ServiceName *> $null
         Import-EnvironmentFile
         [Environment]::SetEnvironmentVariable("WHATSAPP_FORCE_RELINK", "1", "Process")
         Write-Host "Starting the bridge interactively. Scan the WhatsApp QR code, then press Ctrl+C when pairing is complete."
@@ -91,14 +99,16 @@ switch ($Action) {
         if (-not (Test-Path (Join-Path $DataPath "whatsapp.db"))) {
             throw "WhatsApp is not paired yet. Run .\install-windows-service.ps1 -Action pair first."
         }
+        Stop-BridgeServiceIfPresent
         Build-Bridge
 
-        & sc.exe stop $ServiceName *> $null
-        & sc.exe delete $ServiceName *> $null
-        Start-Sleep -Seconds 1
-
         $ServiceCommand = '"' + $BinaryPath + '" -service'
-        Invoke-Sc @("create", $ServiceName, "binPath=", $ServiceCommand, "start=", "auto", "DisplayName=", $DisplayName)
+        if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
+            Invoke-Sc @("config", $ServiceName, "binPath=", $ServiceCommand, "start=", "auto", "DisplayName=", $DisplayName)
+        }
+        else {
+            Invoke-Sc @("create", $ServiceName, "binPath=", $ServiceCommand, "start=", "auto", "DisplayName=", $DisplayName)
+        }
         Invoke-Sc @("description", $ServiceName, "Runs the WhatsApp to Telegram bridge in the background.")
         Invoke-Sc @("failure", $ServiceName, "reset=", "86400", "actions=", "restart/60000/restart/60000/restart/300000")
         Invoke-Sc @("start", $ServiceName)

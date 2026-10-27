@@ -10,6 +10,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/local/wa-telegram-bridge/internal/history"
 	"github.com/local/wa-telegram-bridge/internal/selection"
 	"github.com/local/wa-telegram-bridge/internal/telegram"
 	"github.com/local/wa-telegram-bridge/internal/whatsapp"
@@ -74,6 +75,10 @@ func runBridge(parent context.Context) error {
 		return wa.ReplaySince(ctx, jid, since, func(message whatsapp.Message) error {
 			return bot.SendForwarded(ctx, formatForwardedMessage(message))
 		})
+	}, func(ctx context.Context, jid, fromDate, toDate string, progress history.ReplayProgress) (history.ReplayResult, error) {
+		return wa.ReplayRange(ctx, jid, fromDate, toDate, func(message whatsapp.Message) error {
+			return bot.SendForwarded(ctx, formatForwardedMessage(message))
+		}, progress)
 	})
 	go func() {
 		if err := bot.Run(ctx); err != nil {

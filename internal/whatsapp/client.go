@@ -143,14 +143,17 @@ func (c *Client) Run(ctx context.Context, onMessage func(Message) error, onConne
 					}
 					text := messageText(parsed)
 					if text == "" {
-						continue
+						if parsed.Info.Type == "" {
+							continue
+						}
+						text = "[" + parsed.Info.Type + " message]"
 					}
 					sender := senderName(parsed.Info.Sender, parsed.Info.PushName)
 					if parsed.Info.IsFromMe {
 						sender = "You"
 					}
 					item := history.Message{
-						ChatJID: chatJID, MessageID: parsed.Info.ID, SenderJID: parsed.Info.Sender.String(),
+						ChatJID: chatJID, RequestChatJID: originalJID.String(), MessageID: parsed.Info.ID, SenderJID: parsed.Info.Sender.String(),
 						Timestamp: parsed.Info.Timestamp, Chat: name, Sender: sender, Text: text, FromMe: parsed.Info.IsFromMe,
 					}
 					if kind := mediaKind(parsed.Message); kind != "" {
@@ -216,7 +219,7 @@ func (c *Client) Run(ctx context.Context, onMessage func(Message) error, onConne
 				Timestamp: event.Info.Timestamp, Chat: name, Sender: sender, Text: text, FromMe: event.Info.IsFromMe,
 			}
 			if err := archive.Save(ctx, history.Message{
-				ChatJID: message.ChatJID, MessageID: message.MessageID, SenderJID: message.SenderJID,
+				ChatJID: message.ChatJID, RequestChatJID: event.Info.Chat.String(), MessageID: message.MessageID, SenderJID: message.SenderJID,
 				Timestamp: message.Timestamp, Chat: message.Chat, Sender: message.Sender, Text: message.Text, FromMe: message.FromMe,
 			}); err != nil {
 				fmt.Printf("Could not archive WhatsApp message from %s: %v\n", chatJID, err)
@@ -415,7 +418,8 @@ func (c *Client) ReplaySince(ctx context.Context, chatJID, since string, onMessa
 	if onMessage == nil {
 		return 0, fmt.Errorf("message sender is not available")
 	}
-	if err := c.fetchOlderHistory(ctx, chatJID, cutoff); err != nil {
+	fetchResult, err := c.fetchOlderHistory(ctx, chatJID, cutoff, nil)
+	if err != nil {
 		return 0, err
 	}
 	count := 0
@@ -425,6 +429,9 @@ func (c *Client) ReplaySince(ctx context.Context, chatJID, since string, onMessa
 			return count, err
 		}
 		if len(batch) == 0 {
+			if fetchResult.Detail != "" {
+				return count, fmt.Errorf("WhatsApp history backfill: %s", fetchResult.Detail)
+			}
 			return count, nil
 		}
 		for _, archived := range batch {
@@ -449,9 +456,86 @@ func (c *Client) ReplaySince(ctx context.Context, chatJID, since string, onMessa
 	}
 }
 
-func (c *Client) fetchOlderHistory(ctx context.Context, chatJID string, cutoff time.Time) error {
+func (c *Client) ReplayRange(ctx context.Context, chatJID, fromDate, toDate string, onMessage func(Message) error, onProgress history.ReplayProgress) (history.ReplayResult, error) {
+	result := history.ReplayResult{}
+	if c.archive == nil {
+		return result, fmt.Errorf("local history archive is not ready")
+	}
+	from, err := time.ParseInLocation("2006-01-02", fromDate, time.Local)
+	if err != nil {
+		return result, fmt.Errorf("start date must use YYYY-MM-DD format")
+	}
+	toDay, err := time.ParseInLocation("2006-01-02", toDate, time.Local)
+	if err != nil {
+		return result, fmt.Errorf("end date must use YYYY-MM-DD format")
+	}
+	if toDay.Before(from) {
+		return result, fmt.Errorf("end date must be the same as or later than the start date")
+	}
+	if onMessage == nil {
+		return result, fmt.Errorf("message sender is not available")
+	}
+	until := toDay.AddDate(0, 0, 1)
+	fetchResult, fetchErr := c.fetchOlderHistory(ctx, chatJID, from, onProgress)
+	if fetchErr != nil {
+		if ctx.Err() != nil {
+			return result, ctx.Err()
+		}
+		fetchResult.Detail = fetchErr.Error()
+	}
+	result.ReachedStart = fetchResult.ReachedStart
+	result.Detail = fetchResult.Detail
+	result.Available, err = c.archive.CountRange(ctx, chatJID, from, until)
+	if err != nil {
+		return result, fmt.Errorf("count archived messages in the requested range: %w", err)
+	}
+	if onProgress != nil {
+		onProgress(fmt.Sprintf("Backfill finished. %d messages are available in the selected range; sending them now.", result.Available))
+	}
+
+	var cursor *history.Message
+	for {
+		batch, err := c.archive.Range(ctx, chatJID, from, until, cursor, 1)
+		if err != nil {
+			return result, fmt.Errorf("read archived messages in the requested range: %w", err)
+		}
+		if len(batch) == 0 {
+			return result, nil
+		}
+		for _, archived := range batch {
+			message := Message{
+				ChatJID: archived.ChatJID, MessageID: archived.MessageID, SenderJID: archived.SenderJID,
+				Timestamp: archived.Timestamp, Chat: archived.Chat, Sender: archived.Sender, Text: archived.Text, FromMe: archived.FromMe,
+				MediaKind: archived.MediaKind, MediaName: archived.MediaName, MediaMIME: archived.MediaMIME, MediaData: archived.MediaData,
+			}
+			if err := onMessage(message); err != nil {
+				return result, err
+			}
+			result.Count++
+			if onProgress != nil && result.Count%100 == 0 {
+				onProgress(fmt.Sprintf("Sent %d of %d archived messages in the selected range.", result.Count, result.Available))
+			}
+			last := archived
+			cursor = &last
+			select {
+			case <-ctx.Done():
+				return result, ctx.Err()
+			case <-time.After(100 * time.Millisecond):
+			}
+		}
+	}
+}
+
+type olderHistoryResult struct {
+	ReachedStart bool
+	Detail       string
+}
+
+func (c *Client) fetchOlderHistory(ctx context.Context, chatJID string, cutoff time.Time, onProgress history.ReplayProgress) (olderHistoryResult, error) {
+	result := olderHistoryResult{}
 	if c.client == nil || !c.client.IsLoggedIn() {
-		return fmt.Errorf("WhatsApp is not connected")
+		result.Detail = "WhatsApp is disconnected; only history already present in this bridge was searched."
+		return result, nil
 	}
 	if c.historySyncEvents == nil {
 		c.historySyncEvents = make(chan struct{}, 8)
@@ -461,60 +545,74 @@ func (c *Client) fetchOlderHistory(ctx context.Context, chatJID string, cutoff t
 
 	chat, err := types.ParseJID(chatJID)
 	if err != nil {
-		return fmt.Errorf("invalid chat ID %q: %w", chatJID, err)
+		return result, fmt.Errorf("invalid chat ID %q: %w", chatJID, err)
 	}
-	for page := 0; page < 200; page++ {
+	for page := 0; ; page++ {
 		oldest, found, err := c.archive.Oldest(ctx, chatJID)
 		if err != nil {
-			return fmt.Errorf("find history cursor: %w", err)
+			return result, fmt.Errorf("find history cursor: %w", err)
 		}
 		if !found {
-			return fmt.Errorf("no messages are archived for this chat, so WhatsApp has no known message anchor for an older-history request; wait for a message or history sync first")
+			result.Detail = "No messages are archived for this contact yet, so this linked device has no message anchor for requesting older history."
+			return result, nil
 		}
 		if !oldest.Timestamp.After(cutoff) {
-			return nil
+			result.ReachedStart = true
+			return result, nil
 		}
 
+		requestChat := chat
+		if oldest.RequestChatJID != "" {
+			requestChat, err = types.ParseJID(oldest.RequestChatJID)
+			if err != nil {
+				return result, fmt.Errorf("invalid archived history chat ID %q: %w", oldest.RequestChatJID, err)
+			}
+		} else if chat.Server == types.DefaultUserServer {
+			if lid, lidErr := c.client.Store.LIDs.GetLIDForPN(ctx, chat); lidErr == nil && !lid.IsEmpty() {
+				requestChat = lid
+			}
+		}
 		anchor := &types.MessageInfo{
-			MessageSource: types.MessageSource{Chat: chat, IsFromMe: oldest.FromMe},
+			MessageSource: types.MessageSource{Chat: requestChat, IsFromMe: oldest.FromMe},
 			ID:            oldest.MessageID, Timestamp: oldest.Timestamp,
 		}
 		for len(c.historySyncEvents) > 0 {
 			<-c.historySyncEvents
 		}
+		if page%10 == 0 && onProgress != nil {
+			onProgress(fmt.Sprintf("Requesting WhatsApp history page %d for %s; current oldest message is %s.", page+1, c.chatName(chatJID), oldest.Timestamp.Format("2006-01-02 15:04:05")))
+		}
 		fmt.Printf("Requesting WhatsApp history page %d for %s before %s (%s).\n", page+1, chatJID, oldest.Timestamp.Format("2006-01-02 15:04:05"), oldest.MessageID)
 		if _, err := c.client.SendPeerMessage(ctx, c.client.BuildHistorySyncRequest(anchor, 50)); err != nil {
-			return fmt.Errorf("request older WhatsApp history: %w", err)
+			result.Detail = fmt.Sprintf("WhatsApp rejected the older-history request: %v", err)
+			return result, nil
 		}
 
 		timer := time.NewTimer(30 * time.Second)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return ctx.Err()
+			return result, ctx.Err()
 		case <-timer.C:
-			return fmt.Errorf("timed out waiting for WhatsApp to return older history; it may not be available on the linked device")
+			result.Detail = fmt.Sprintf("WhatsApp did not return an older-history page within 30 seconds. The oldest archived message is from %s.", oldest.Timestamp.Format("2006-01-02"))
+			return result, nil
 		case <-c.historySyncEvents:
 			timer.Stop()
 		}
 
 		updated, found, err := c.archive.Oldest(ctx, chatJID)
 		if err != nil {
-			return fmt.Errorf("check older WhatsApp history: %w", err)
+			return result, fmt.Errorf("check older WhatsApp history: %w", err)
 		}
 		if !found || !isOlderCursor(updated, oldest) {
-			fmt.Printf("WhatsApp returned no older history for %s before %s.\n", chatJID, oldest.Timestamp.Format("2006-01-02"))
-			return nil
+			result.Detail = fmt.Sprintf("WhatsApp returned no older messages before %s. The oldest message currently archived for this contact is from %s.", cutoff.Format("2006-01-02"), oldest.Timestamp.Format("2006-01-02"))
+			return result, nil
 		}
 	}
-	return fmt.Errorf("stopped after 200 history pages (10,000 requested messages); choose a later cutoff to continue safely")
 }
 
 func isOlderCursor(candidate, current history.Message) bool {
-	if candidate.Timestamp.Before(current.Timestamp) {
-		return true
-	}
-	return candidate.Timestamp.Equal(current.Timestamp) && candidate.MessageID != current.MessageID
+	return candidate.Timestamp.Before(current.Timestamp)
 }
 
 func displayPairingQR(value string) error {
@@ -687,6 +785,9 @@ func messageText(event *events.Message) string {
 	}
 	if caption := message.GetDocumentMessage().GetCaption(); caption != "" {
 		return "[Document] " + caption
+	}
+	if kind := mediaKind(message); kind != "" {
+		return "[" + kind + " message]"
 	}
 	if event.Info.Type != "" {
 		return "[" + event.Info.Type + " message]"
