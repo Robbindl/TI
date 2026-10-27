@@ -44,6 +44,53 @@ go vet ./...
 go build -o wa-telegram-bridge.exe ./cmd/bridge
 ```
 
+## Deploy to Fly.io
+
+This is a single background worker, not an HTTP service. Run one Fly Machine and attach a persistent volume at `/app/data`; the WhatsApp session, selected chats, and message history are stored there.
+
+Install and authenticate with `flyctl`, then run these commands from the project folder:
+
+```powershell
+fly auth login
+fly apps create ti-wa-telegram-bridge
+fly volumes create bridge_data --app ti-wa-telegram-bridge --region lax --size 1
+fly secrets set TELEGRAM_BOT_TOKEN="your BotFather token" TELEGRAM_OWNER_ID="your numeric Telegram user ID" --app ti-wa-telegram-bridge
+fly deploy --app ti-wa-telegram-bridge
+```
+
+If the app name is already taken, change `app` in `fly.toml` and use the same name in these commands. Watch the first-start QR code with:
+
+```powershell
+fly logs --app ti-wa-telegram-bridge
+```
+
+Then scan it from WhatsApp's **Linked devices** screen. Keep the app at one Machine because the Fly volume is local to that Machine and is not shared automatically.
+
+## Run as a Windows service
+
+For a local always-on setup, open PowerShell as Administrator in the project folder and pair WhatsApp once interactively:
+
+```powershell
+.\install-windows-service.ps1 -Action pair
+```
+
+Scan the QR code, then press `Ctrl+C` after the WhatsApp connection succeeds. Register the automatic service afterward:
+
+```powershell
+.\install-windows-service.ps1 -Action install
+```
+
+The installer prompts for the Telegram bot token and owner ID, builds the executable, registers an automatic Windows service, and configures restart-on-failure. Service logs are written to `data/service.log` and the WhatsApp session remains in `data/`.
+
+Manage the service with:
+
+```powershell
+.\install-windows-service.ps1 -Action status
+.\install-windows-service.ps1 -Action stop
+.\install-windows-service.ps1 -Action start
+.\install-windows-service.ps1 -Action uninstall
+```
+
 ## Current scope
 
 - One linked WhatsApp account and one Telegram owner

@@ -1,0 +1,17 @@
+app = "ti-wa-telegram-bridge"
+primary_region = "lax"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[processes]
+  app = "/app/bridge"
+
+[[mounts]]
+  source = "bridge_data"
+  destination = "/app/data"
+
+[[vm]]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1

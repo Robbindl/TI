@@ -16,24 +16,39 @@ import (
 )
 
 func main() {
-	token := strings.TrimSpace(os.Getenv("TELEGRAM_BOT_TOKEN"))
-	if token == "" {
-		log.Fatal("TELEGRAM_BOT_TOKEN is required; create a bot with BotFather and set the token as an environment variable")
-	}
-	ownerID, err := strconv.ParseInt(strings.TrimSpace(os.Getenv("TELEGRAM_OWNER_ID")), 10, 64)
-	if err != nil || ownerID <= 0 {
-		log.Fatal("TELEGRAM_OWNER_ID must be your numeric Telegram user ID")
-	}
-
-	if err := os.MkdirAll("data", 0o700); err != nil {
-		log.Fatalf("create data directory: %v", err)
-	}
-	selectedChats, err := selection.Open("data/selected-chats.json")
-	if err != nil {
-		log.Fatalf("load selected chats: %v", err)
+	if len(os.Args) > 1 && os.Args[1] == "-service" {
+		if err := runWindowsService(); err != nil {
+			log.Fatal(err)
+		}
+		return
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := runBridge(ctx); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func runBridge(parent context.Context) error {
+	token := strings.TrimSpace(os.Getenv("TELEGRAM_BOT_TOKEN"))
+	if token == "" {
+		return fmt.Errorf("TELEGRAM_BOT_TOKEN is required; create a bot with BotFather and set the token as an environment variable")
+	}
+	ownerID, err := strconv.ParseInt(strings.TrimSpace(os.Getenv("TELEGRAM_OWNER_ID")), 10, 64)
+	if err != nil || ownerID <= 0 {
+		return fmt.Errorf("TELEGRAM_OWNER_ID must be your numeric Telegram user ID")
+	}
+
+	if err := os.MkdirAll("data", 0o700); err != nil {
+		return fmt.Errorf("create data directory: %w", err)
+	}
+	selectedChats, err := selection.Open("data/selected-chats.json")
+	if err != nil {
+		return fmt.Errorf("load selected chats: %w", err)
+	}
+
+	ctx, stop := context.WithCancel(parent)
 	defer stop()
 	wa := whatsapp.New(selectedChats)
 	var bot *telegram.Bot
@@ -76,8 +91,9 @@ func main() {
 		}
 	})
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
+	return nil
 }
 
 func formatForwardedMessage(message whatsapp.Message) telegram.ForwardedMessage {

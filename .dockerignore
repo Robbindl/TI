@@ -1,0 +1,13 @@
+.git
+.github
+data
+*.exe
+*.exe~
+*.test
+*.out
+.env
+.env.*
+!.env.example
+Dockerfile
+fly.toml
+README.md
