@@ -14,6 +14,7 @@ import (
 
 	"github.com/local/wa-telegram-bridge/internal/history"
 	"github.com/local/wa-telegram-bridge/internal/selection"
+	"github.com/local/wa-telegram-bridge/internal/timezone"
 	"github.com/mdp/qrterminal/v3"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
@@ -115,7 +116,7 @@ func (c *Client) Run(ctx context.Context, onMessage func(Message) error, onConne
 			if !event.GroupJID.IsEmpty() {
 				chat = event.GroupJID
 			}
-			c.forwardCall(ctx, chat, "Incoming WhatsApp "+firstNonEmpty(event.Media, "voice")+" group call", onMessage)
+			c.forwardCall(ctx, chat, "Incoming WhatsApp "+firstNonBlank(event.Media, "voice")+" group call", onMessage)
 		case *events.CallTerminate:
 			chat := event.From
 			if !event.GroupJID.IsEmpty() {
@@ -405,7 +406,7 @@ func (c *Client) shouldForward(message Message) (bool, bool) {
 	if since == "" {
 		return true, true
 	}
-	cutoff, err := time.ParseInLocation("2006-01-02", since, time.Local)
+	cutoff, err := time.ParseInLocation("2006-01-02", since, timezone.Kenya)
 	return true, err == nil && !message.Timestamp.Before(cutoff)
 }
 
@@ -413,7 +414,7 @@ func (c *Client) ReplaySince(ctx context.Context, chatJID, since string, onMessa
 	if c.archive == nil {
 		return 0, fmt.Errorf("local history archive is not ready")
 	}
-	cutoff, err := time.ParseInLocation("2006-01-02", since, time.Local)
+	cutoff, err := time.ParseInLocation("2006-01-02", since, timezone.Kenya)
 	if err != nil {
 		return 0, fmt.Errorf("cutoff must use YYYY-MM-DD format")
 	}
@@ -463,11 +464,11 @@ func (c *Client) ReplayRange(ctx context.Context, chatJID, fromDate, toDate stri
 	if c.archive == nil {
 		return result, fmt.Errorf("local history archive is not ready")
 	}
-	from, err := time.ParseInLocation("2006-01-02", fromDate, time.Local)
+	from, err := time.ParseInLocation("2006-01-02", fromDate, timezone.Kenya)
 	if err != nil {
 		return result, fmt.Errorf("start date must use YYYY-MM-DD format")
 	}
-	toDay, err := time.ParseInLocation("2006-01-02", toDate, time.Local)
+	toDay, err := time.ParseInLocation("2006-01-02", toDate, timezone.Kenya)
 	if err != nil {
 		return result, fmt.Errorf("end date must use YYYY-MM-DD format")
 	}
@@ -532,7 +533,32 @@ func (c *Client) ContactsContacted(ctx context.Context, from, until time.Time) (
 	if c.archive == nil {
 		return nil, fmt.Errorf("local history archive is not ready")
 	}
-	return c.archive.ContactsContacted(ctx, from, until)
+	contacts, err := c.archive.ContactsContacted(ctx, from, until)
+	if err != nil {
+		return nil, err
+	}
+	for i := range contacts {
+		jid, err := types.ParseJID(contacts[i].JID)
+		if err != nil {
+			continue
+		}
+		resolved, liveName := c.resolveChat(ctx, jid, "")
+		if isUsableContactName(liveName, resolved) {
+			contacts[i].Name = liveName
+			continue
+		}
+		if isUsableContactName(contacts[i].Name, resolved) {
+			continue
+		}
+		if resolved.Server == types.HiddenUserServer {
+			contacts[i].Name = "WhatsApp contact (name unavailable)"
+		} else if resolved.User != "" {
+			contacts[i].Name = resolved.User
+		} else {
+			contacts[i].Name = contacts[i].JID
+		}
+	}
+	return contacts, nil
 }
 
 type olderHistoryResult struct {
@@ -603,7 +629,7 @@ func (c *Client) fetchOlderHistory(ctx context.Context, chatJID string, cutoff t
 			timer.Stop()
 			return result, ctx.Err()
 		case <-timer.C:
-			result.Detail = fmt.Sprintf("WhatsApp did not return an older-history page within 30 seconds. The oldest archived message is from %s.", oldest.Timestamp.Format("2006-01-02"))
+			result.Detail = fmt.Sprintf("WhatsApp did not return an older-history page within 30 seconds. The oldest archived message is from %s.", oldest.Timestamp.In(timezone.Kenya).Format("2006-01-02"))
 			return result, nil
 		case <-c.historySyncEvents:
 			timer.Stop()
@@ -614,7 +640,7 @@ func (c *Client) fetchOlderHistory(ctx context.Context, chatJID string, cutoff t
 			return result, fmt.Errorf("check older WhatsApp history: %w", err)
 		}
 		if !found || !isOlderCursor(updated, oldest) {
-			result.Detail = fmt.Sprintf("WhatsApp returned no older messages before %s. The oldest message currently archived for this contact is from %s.", cutoff.Format("2006-01-02"), oldest.Timestamp.Format("2006-01-02"))
+			result.Detail = fmt.Sprintf("WhatsApp returned no older messages before %s. The oldest message currently archived for this contact is from %s.", cutoff.Format("2006-01-02"), oldest.Timestamp.In(timezone.Kenya).Format("2006-01-02"))
 			return result, nil
 		}
 	}
@@ -656,7 +682,7 @@ func (c *Client) RefreshChats(ctx context.Context) error {
 	}
 	chats := make(map[string]string, len(contacts))
 	for jid, info := range contacts {
-		resolved, name := c.resolveChat(ctx, jid, firstNonEmpty(info.FullName, info.FirstName, info.PushName, info.BusinessName))
+		resolved, name := c.resolveChat(ctx, jid, firstNonBlank(info.FullName, info.FirstName, info.PushName, info.BusinessName))
 		chats[resolved.String()] = name
 	}
 	for _, cachedChat := range c.Chats() {
@@ -675,7 +701,7 @@ func (c *Client) RefreshChats(ctx context.Context) error {
 		return fmt.Errorf("load WhatsApp groups: %w", err)
 	}
 	for _, group := range groups {
-		chats[group.JID.String()] = firstNonEmpty(group.Name, group.JID.String())
+		chats[group.JID.String()] = firstNonBlank(group.Name, group.JID.String())
 	}
 
 	list := make([]Chat, 0, len(chats))
@@ -740,19 +766,27 @@ func (c *Client) resolveChat(ctx context.Context, jid types.JID, preferredName s
 	}
 	if c.client != nil && (jid.Server == types.DefaultUserServer || jid.Server == types.LegacyUserServer) {
 		if info, err := c.client.Store.Contacts.GetContact(ctx, jid); err == nil {
-			name = firstNonEmpty(info.FullName, info.FirstName, info.PushName, info.BusinessName, name)
+			name = firstNonBlank(info.FullName, info.FirstName, info.PushName, info.BusinessName, name)
 		}
+	}
+	if name == "Unknown chat" || name == "Unknown private chat" || name == originalJID.String() || name == originalJID.User {
+		name = ""
 	}
 	if name == "" && originalJID.Server == types.HiddenUserServer && c.client != nil {
 		if info, err := c.client.Store.Contacts.GetContact(ctx, originalJID); err == nil {
-			name = firstNonEmpty(info.FullName, info.FirstName, info.PushName, info.BusinessName)
+			name = firstNonBlank(info.FullName, info.FirstName, info.PushName, info.BusinessName)
 		}
 	}
 	fallback := jid.User
 	if jid.Server == types.HiddenUserServer {
 		fallback = "Unknown private chat"
 	}
-	return jid, firstNonEmpty(name, fallback)
+	return jid, firstNonBlank(name, fallback)
+}
+
+func isUsableContactName(name string, jid types.JID) bool {
+	name = strings.TrimSpace(name)
+	return name != "" && name != "Unknown chat" && name != "Unknown private chat" && name != "Unknown sender" && name != jid.String() && name != jid.User && !strings.Contains(name, "@")
 }
 
 func (c *Client) PrintChats() {
@@ -814,11 +848,11 @@ func senderName(jid types.JID, pushName string) string {
 	return "Unknown sender"
 }
 
-func firstNonEmpty(values ...string) string {
+func firstNonBlank(values ...string) string {
 	for _, value := range values {
 		if strings.TrimSpace(value) != "" {
 			return value
 		}
 	}
-	return "Unknown chat"
+	return ""
 }

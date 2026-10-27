@@ -19,6 +19,7 @@ import (
 
 	"github.com/local/wa-telegram-bridge/internal/history"
 	"github.com/local/wa-telegram-bridge/internal/selection"
+	"github.com/local/wa-telegram-bridge/internal/timezone"
 )
 
 const chatsPerPage = 8
@@ -282,7 +283,7 @@ func (b *Bot) handleUpdate(ctx context.Context, item update) {
 				_ = b.sendText(ctx, b.ownerID, "Date request cancelled.", inlineKeyboard{})
 				return
 			}
-			date, err := time.ParseInLocation("2006-01-02", dateInput, time.Local)
+			date, err := time.ParseInLocation("2006-01-02", dateInput, timezone.Kenya)
 			if err != nil {
 				_ = b.sendText(ctx, b.ownerID, "Send a date in YYYY-MM-DD format, for example 2026-03-15. Send /cancel to stop.", inlineKeyboard{})
 				return
@@ -294,7 +295,7 @@ func (b *Bot) handleUpdate(ctx context.Context, item update) {
 					return
 				}
 				fromDate := b.pendingFrom
-				from, _ := time.ParseInLocation("2006-01-02", fromDate, time.Local)
+				from, _ := time.ParseInLocation("2006-01-02", fromDate, timezone.Kenya)
 				if date.Before(from) {
 					_ = b.sendText(ctx, b.ownerID, "The end date must be the same as or later than the start date. Send the end date again, or /cancel.", inlineKeyboard{})
 					return
@@ -311,7 +312,7 @@ func (b *Bot) handleUpdate(ctx context.Context, item update) {
 			}
 			if b.pendingRange {
 				fromDate := b.pendingFrom
-				from, _ := time.ParseInLocation("2006-01-02", fromDate, time.Local)
+				from, _ := time.ParseInLocation("2006-01-02", fromDate, timezone.Kenya)
 				if date.Before(from) {
 					_ = b.sendText(ctx, b.ownerID, "The end date must be the same as or later than the start date. Send the end date again, or /cancel.", inlineKeyboard{})
 					return
@@ -379,7 +380,7 @@ func (b *Bot) handleUpdate(ctx context.Context, item update) {
 	query := item.CallbackQuery
 	if query.Data == "contacts_today" {
 		b.clearPendingDate()
-		today := time.Now().In(time.Local).Format("2006-01-02")
+		today := time.Now().In(timezone.Kenya).Format("2006-01-02")
 		go b.runContactReport(ctx, today, today)
 		b.answerCallback(ctx, query.ID)
 		return
@@ -454,12 +455,12 @@ func (b *Bot) runContactReport(ctx context.Context, fromDate, toDate string) {
 		_ = b.sendText(ctx, b.ownerID, "Contact reports are unavailable right now.", inlineKeyboard{})
 		return
 	}
-	from, err := time.ParseInLocation("2006-01-02", fromDate, time.Local)
+	from, err := time.ParseInLocation("2006-01-02", fromDate, timezone.Kenya)
 	if err != nil {
 		_ = b.sendText(ctx, b.ownerID, "The start date is invalid.", inlineKeyboard{})
 		return
 	}
-	to, err := time.ParseInLocation("2006-01-02", toDate, time.Local)
+	to, err := time.ParseInLocation("2006-01-02", toDate, timezone.Kenya)
 	if err != nil {
 		_ = b.sendText(ctx, b.ownerID, "The end date is invalid.", inlineKeyboard{})
 		return
@@ -477,7 +478,7 @@ func (b *Bot) runContactReport(ctx context.Context, fromDate, toDate string) {
 	fmt.Fprintf(&report, "People who contacted you from %s through %s (from saved incoming messages):\n", fromDate, toDate)
 	for _, contact := range contacts {
 		name := strings.ReplaceAll(strings.ReplaceAll(contact.Name, "\r", " "), "\n", " ")
-		fmt.Fprintf(&report, "• %s — %d message(s), last %s\n", name, contact.MessageCount, contact.LastContact.In(time.Local).Format("2006-01-02 15:04"))
+		fmt.Fprintf(&report, "• %s — %d message(s), last %s\n", name, contact.MessageCount, contact.LastContact.In(timezone.Kenya).Format("2006-01-02 15:04"))
 	}
 	if err := b.sendLongText(ctx, report.String()); err != nil {
 		fmt.Printf("Could not send contacts report to Telegram: %v\n", err)

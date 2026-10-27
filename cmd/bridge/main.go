@@ -14,6 +14,7 @@ import (
 	"github.com/local/wa-telegram-bridge/internal/history"
 	"github.com/local/wa-telegram-bridge/internal/selection"
 	"github.com/local/wa-telegram-bridge/internal/telegram"
+	"github.com/local/wa-telegram-bridge/internal/timezone"
 	"github.com/local/wa-telegram-bridge/internal/whatsapp"
 )
 
@@ -105,7 +106,7 @@ func runBridge(parent context.Context) error {
 }
 
 func formatForwardedMessage(message whatsapp.Message) telegram.ForwardedMessage {
-	stamp := message.Timestamp.Local().Format("2006-01-02 15:04")
+	stamp := message.Timestamp.In(timezone.Kenya).Format("2006-01-02 15:04")
 	return telegram.ForwardedMessage{
 		Chat: message.Chat, Sender: message.Sender, Timestamp: stamp, Text: message.Text,
 		MediaKind: message.MediaKind, MediaName: message.MediaName, MediaMIME: message.MediaMIME, MediaData: message.MediaData,

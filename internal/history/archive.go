@@ -254,7 +254,12 @@ func (a *Archive) ContactsContacted(ctx context.Context, from, until time.Time) 
 	defer a.mu.Unlock()
 	rows, err := a.db.QueryContext(ctx, `WITH ranked_contacts AS (
 		SELECT chat_jid,
-			COALESCE(NULLIF(chat_name, ''), NULLIF(sender_name, ''), chat_jid) AS contact_name,
+			COALESCE(
+				NULLIF(CASE WHEN sender_name NOT IN ('', 'Unknown sender', 'Unknown chat', 'Unknown private chat') AND instr(sender_name, '@') = 0 THEN sender_name END, ''),
+				NULLIF(CASE WHEN sender_name NOT IN ('', 'Unknown sender', 'Unknown chat', 'Unknown private chat') AND instr(sender_name, '@') = 0 THEN sender_name END, ''),
+				NULLIF(CASE WHEN chat_name NOT IN ('', 'Unknown chat', 'Unknown private chat') AND instr(chat_name, '@') = 0 THEN chat_name END, ''),
+				chat_jid
+			) AS contact_name,
 			timestamp_unix,
 			COUNT(*) OVER (PARTITION BY chat_jid) AS message_count,
 			ROW_NUMBER() OVER (PARTITION BY chat_jid ORDER BY timestamp_unix DESC, message_id DESC) AS row_number
