@@ -37,6 +37,13 @@ type ReplayResult struct {
 
 type ReplayProgress func(string)
 
+type Contact struct {
+	JID          string
+	Name         string
+	MessageCount int
+	LastContact  time.Time
+}
+
 type Archive struct {
 	mu sync.Mutex
 	db *sql.DB
@@ -237,6 +244,42 @@ func (a *Archive) CountRange(ctx context.Context, chatJID string, from, until ti
 	err := a.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM message_history
 		WHERE chat_jid = ? AND timestamp_unix >= ? AND timestamp_unix < ?`, chatJID, from.Unix(), until.Unix()).Scan(&count)
 	return count, err
+}
+
+func (a *Archive) ContactsContacted(ctx context.Context, from, until time.Time) ([]Contact, error) {
+	if !until.After(from) {
+		return nil, fmt.Errorf("contact report end must be later than its start")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	rows, err := a.db.QueryContext(ctx, `WITH ranked_contacts AS (
+		SELECT chat_jid,
+			COALESCE(NULLIF(chat_name, ''), NULLIF(sender_name, ''), chat_jid) AS contact_name,
+			timestamp_unix,
+			COUNT(*) OVER (PARTITION BY chat_jid) AS message_count,
+			ROW_NUMBER() OVER (PARTITION BY chat_jid ORDER BY timestamp_unix DESC, message_id DESC) AS row_number
+		FROM message_history
+		WHERE from_me = 0 AND timestamp_unix >= ? AND timestamp_unix < ?
+			AND (chat_jid GLOB '*@s.whatsapp.net' OR chat_jid GLOB '*@lid' OR chat_jid GLOB '*@c.us')
+	)
+	SELECT chat_jid, contact_name, message_count, timestamp_unix
+	FROM ranked_contacts WHERE row_number = 1
+	ORDER BY timestamp_unix DESC, contact_name COLLATE NOCASE`, from.Unix(), until.Unix())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var contacts []Contact
+	for rows.Next() {
+		var contact Contact
+		var lastContact int64
+		if err := rows.Scan(&contact.JID, &contact.Name, &contact.MessageCount, &lastContact); err != nil {
+			return nil, err
+		}
+		contact.LastContact = time.Unix(lastContact, 0)
+		contacts = append(contacts, contact)
+	}
+	return contacts, rows.Err()
 }
 
 func (a *Archive) Oldest(ctx context.Context, chatJID string) (Message, bool, error) {

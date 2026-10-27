@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/local/wa-telegram-bridge/internal/history"
 	"github.com/local/wa-telegram-bridge/internal/selection"
@@ -79,6 +80,8 @@ func runBridge(parent context.Context) error {
 		return wa.ReplayRange(ctx, jid, fromDate, toDate, func(message whatsapp.Message) error {
 			return bot.SendForwarded(ctx, formatForwardedMessage(message))
 		}, progress)
+	}, func(ctx context.Context, from, until time.Time) ([]history.Contact, error) {
+		return wa.ContactsContacted(ctx, from, until)
 	})
 	go func() {
 		if err := bot.Run(ctx); err != nil {

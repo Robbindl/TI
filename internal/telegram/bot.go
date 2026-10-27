@@ -43,20 +43,22 @@ type ForwardedMessage struct {
 }
 
 type Bot struct {
-	token        string
-	ownerID      int64
-	selection    *selection.Store
-	chats        func() []Chat
-	refresh      func(context.Context) error
-	setSince     func(context.Context, string, string) (int, error)
-	replayRange  func(context.Context, string, string, string, history.ReplayProgress) (history.ReplayResult, error)
-	http         *http.Client
-	pendingJID   string
-	pendingPage  int
-	pendingRange bool
-	pendingFrom  string
-	historyMu    sync.Mutex
-	historyBusy  bool
+	token           string
+	ownerID         int64
+	selection       *selection.Store
+	chats           func() []Chat
+	refresh         func(context.Context) error
+	setSince        func(context.Context, string, string) (int, error)
+	replayRange     func(context.Context, string, string, string, history.ReplayProgress) (history.ReplayResult, error)
+	contactRange    func(context.Context, time.Time, time.Time) ([]history.Contact, error)
+	http            *http.Client
+	pendingJID      string
+	pendingPage     int
+	pendingRange    bool
+	pendingContacts bool
+	pendingFrom     string
+	historyMu       sync.Mutex
+	historyBusy     bool
 }
 
 type update struct {
@@ -101,16 +103,17 @@ type apiResponse struct {
 	} `json:"parameters"`
 }
 
-func New(token string, ownerID int64, store *selection.Store, chats func() []Chat, refresh func(context.Context) error, setSince func(context.Context, string, string) (int, error), replayRange func(context.Context, string, string, string, history.ReplayProgress) (history.ReplayResult, error)) *Bot {
+func New(token string, ownerID int64, store *selection.Store, chats func() []Chat, refresh func(context.Context) error, setSince func(context.Context, string, string) (int, error), replayRange func(context.Context, string, string, string, history.ReplayProgress) (history.ReplayResult, error), contactRange func(context.Context, time.Time, time.Time) ([]history.Contact, error)) *Bot {
 	return &Bot{
-		token:       token,
-		ownerID:     ownerID,
-		selection:   store,
-		chats:       chats,
-		refresh:     refresh,
-		setSince:    setSince,
-		replayRange: replayRange,
-		http:        &http.Client{Timeout: 65 * time.Second},
+		token:        token,
+		ownerID:      ownerID,
+		selection:    store,
+		chats:        chats,
+		refresh:      refresh,
+		setSince:     setSince,
+		replayRange:  replayRange,
+		contactRange: contactRange,
+		http:         &http.Client{Timeout: 65 * time.Second},
 	}
 }
 
@@ -272,16 +275,33 @@ func (b *Bot) handleUpdate(ctx context.Context, item update) {
 		if item.Message.From.ID != b.ownerID || item.Message.Chat.ID != b.ownerID {
 			return
 		}
-		if b.pendingJID != "" {
+		if b.pendingJID != "" || b.pendingContacts {
 			dateInput := strings.TrimSpace(item.Message.Text)
 			if strings.EqualFold(dateInput, "/cancel") {
 				b.clearPendingDate()
-				_ = b.sendText(ctx, b.ownerID, "History request cancelled.", inlineKeyboard{})
+				_ = b.sendText(ctx, b.ownerID, "Date request cancelled.", inlineKeyboard{})
 				return
 			}
 			date, err := time.ParseInLocation("2006-01-02", dateInput, time.Local)
 			if err != nil {
 				_ = b.sendText(ctx, b.ownerID, "Send a date in YYYY-MM-DD format, for example 2026-03-15. Send /cancel to stop.", inlineKeyboard{})
+				return
+			}
+			if b.pendingContacts {
+				if b.pendingFrom == "" {
+					b.pendingFrom = date.Format("2006-01-02")
+					_ = b.sendText(ctx, b.ownerID, "Now send the inclusive end date in YYYY-MM-DD format. Send /cancel to stop.", inlineKeyboard{})
+					return
+				}
+				fromDate := b.pendingFrom
+				from, _ := time.ParseInLocation("2006-01-02", fromDate, time.Local)
+				if date.Before(from) {
+					_ = b.sendText(ctx, b.ownerID, "The end date must be the same as or later than the start date. Send the end date again, or /cancel.", inlineKeyboard{})
+					return
+				}
+				toDate := date.Format("2006-01-02")
+				b.clearPendingDate()
+				go b.runContactReport(ctx, fromDate, toDate)
 				return
 			}
 			if b.pendingRange && b.pendingFrom == "" {
@@ -336,7 +356,7 @@ func (b *Bot) handleUpdate(ctx context.Context, item update) {
 		}
 		switch strings.SplitN(command[0], "@", 2)[0] {
 		case "/start", "/help":
-			_ = b.sendText(ctx, b.ownerID, "WhatsApp bridge is ready. Use /chats to choose which chats forward here.", inlineKeyboard{})
+			_ = b.sendText(ctx, b.ownerID, "WhatsApp bridge is ready. Use /chats to choose forwarding chats, or /contacts to see who messaged you today or during a date range.", inlineKeyboard{})
 		case "/chats":
 			if b.refresh != nil {
 				refreshCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
@@ -348,6 +368,8 @@ func (b *Bot) handleUpdate(ctx context.Context, item update) {
 				}
 			}
 			b.showChats(ctx, b.ownerID, 0, 0)
+		case "/contacts":
+			b.showContactOptions(ctx, b.ownerID)
 		}
 		return
 	}
@@ -355,6 +377,23 @@ func (b *Bot) handleUpdate(ctx context.Context, item update) {
 		return
 	}
 	query := item.CallbackQuery
+	if query.Data == "contacts_today" {
+		b.clearPendingDate()
+		today := time.Now().In(time.Local).Format("2006-01-02")
+		go b.runContactReport(ctx, today, today)
+		b.answerCallback(ctx, query.ID)
+		return
+	}
+	if query.Data == "contacts_range" {
+		b.pendingJID = ""
+		b.pendingPage = 0
+		b.pendingRange = false
+		b.pendingContacts = true
+		b.pendingFrom = ""
+		_ = b.sendText(ctx, query.Message.Chat.ID, "Send the inclusive start date for the contacts report as YYYY-MM-DD. Then I’ll ask for the end date. Send /cancel to stop.", inlineKeyboard{})
+		b.answerCallback(ctx, query.ID)
+		return
+	}
 	parts := strings.Split(query.Data, "|")
 	if len(parts) == 2 && parts[0] == "page" {
 		page, err := strconv.Atoi(parts[1])
@@ -384,6 +423,7 @@ func (b *Bot) handleUpdate(ctx context.Context, item update) {
 			b.pendingJID = parts[1]
 			b.pendingPage = page
 			b.pendingRange = false
+			b.pendingContacts = false
 			b.pendingFrom = ""
 			_ = b.sendText(ctx, query.Message.Chat.ID, "Set the earliest date for live forwarding and import available history from that date. Send YYYY-MM-DD, or /cancel.", inlineKeyboard{})
 		}
@@ -393,6 +433,7 @@ func (b *Bot) handleUpdate(ctx context.Context, item update) {
 			b.pendingJID = parts[1]
 			b.pendingPage = page
 			b.pendingRange = true
+			b.pendingContacts = false
 			b.pendingFrom = ""
 			_ = b.sendText(ctx, query.Message.Chat.ID, "Send the inclusive start date for this chat as YYYY-MM-DD. Then I’ll ask for the inclusive end date. Send /cancel to stop.", inlineKeyboard{})
 		}
@@ -404,7 +445,51 @@ func (b *Bot) clearPendingDate() {
 	b.pendingJID = ""
 	b.pendingPage = 0
 	b.pendingRange = false
+	b.pendingContacts = false
 	b.pendingFrom = ""
+}
+
+func (b *Bot) runContactReport(ctx context.Context, fromDate, toDate string) {
+	if b.contactRange == nil {
+		_ = b.sendText(ctx, b.ownerID, "Contact reports are unavailable right now.", inlineKeyboard{})
+		return
+	}
+	from, err := time.ParseInLocation("2006-01-02", fromDate, time.Local)
+	if err != nil {
+		_ = b.sendText(ctx, b.ownerID, "The start date is invalid.", inlineKeyboard{})
+		return
+	}
+	to, err := time.ParseInLocation("2006-01-02", toDate, time.Local)
+	if err != nil {
+		_ = b.sendText(ctx, b.ownerID, "The end date is invalid.", inlineKeyboard{})
+		return
+	}
+	contacts, err := b.contactRange(ctx, from, to.AddDate(0, 0, 1))
+	if err != nil {
+		_ = b.sendText(ctx, b.ownerID, "Could not read the contact report: "+err.Error(), inlineKeyboard{})
+		return
+	}
+	if len(contacts) == 0 {
+		_ = b.sendText(ctx, b.ownerID, fmt.Sprintf("No incoming messages from individual WhatsApp contacts were found in the local archive from %s through %s.", fromDate, toDate), inlineKeyboard{})
+		return
+	}
+	var report strings.Builder
+	fmt.Fprintf(&report, "People who contacted you from %s through %s (from saved incoming messages):\n", fromDate, toDate)
+	for _, contact := range contacts {
+		name := strings.ReplaceAll(strings.ReplaceAll(contact.Name, "\r", " "), "\n", " ")
+		fmt.Fprintf(&report, "• %s — %d message(s), last %s\n", name, contact.MessageCount, contact.LastContact.In(time.Local).Format("2006-01-02 15:04"))
+	}
+	if err := b.sendLongText(ctx, report.String()); err != nil {
+		fmt.Printf("Could not send contacts report to Telegram: %v\n", err)
+	}
+}
+
+func (b *Bot) showContactOptions(ctx context.Context, chatID int64) {
+	keyboard := inlineKeyboard{InlineKeyboard: [][]inlineButton{{
+		{Text: "Today", CallbackData: "contacts_today"},
+		{Text: "Choose date range", CallbackData: "contacts_range"},
+	}}}
+	_ = b.sendText(ctx, chatID, "Show individual WhatsApp contacts who sent you messages:", keyboard)
 }
 
 func (b *Bot) runHistoryRange(ctx context.Context, jid, fromDate, toDate string, page int) {
@@ -448,6 +533,10 @@ func (b *Bot) showChats(ctx context.Context, chatID, messageID int64, page int) 
 	start := page * chatsPerPage
 	end := min(start+chatsPerPage, len(chats))
 	keyboard := inlineKeyboard{}
+	keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, []inlineButton{
+		{Text: "Contacts today", CallbackData: "contacts_today"},
+		{Text: "Contacts by date range", CallbackData: "contacts_range"},
+	})
 	for _, chat := range chats[start:end] {
 		icon := "OFF"
 		if chat.Enabled {
@@ -476,7 +565,7 @@ func (b *Bot) showChats(ctx context.Context, chatID, messageID int64, page int) 
 	if len(navigation) > 0 {
 		keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, navigation)
 	}
-	text := fmt.Sprintf("Forwarding selection (%d chats, page %d/%d):\nON/OFF controls live forwarding. Since sets a forwarding cutoff. History range sends an inclusive date range again whenever requested.", len(chats), page+1, totalPages)
+	text := fmt.Sprintf("Forwarding selection (%d chats, page %d/%d):\nON/OFF controls live forwarding. Since sets a forwarding cutoff. History range sends an inclusive date range again whenever requested. Contact reports list people with incoming messages in the selected dates.", len(chats), page+1, totalPages)
 	if messageID == 0 {
 		_ = b.sendText(ctx, chatID, text, keyboard)
 		return

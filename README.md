@@ -8,6 +8,8 @@ WhatsApp connectivity is provided by the unofficial `whatsmeow` library, not the
 
 The WhatsApp linked-device session is stored in `data/whatsapp.db`. Synced text and captions are archived locally in `data/message-history.db` so date-based replay can work after WhatsApp's sync has completed. Treat both databases as sensitive. The Telegram bot token and owner ID are read from environment variables, not files in the repository.
 
+Use `/contacts` or the buttons in `/chats` to list individual WhatsApp contacts who sent incoming messages today or during an inclusive date range. Reports use messages currently present in the local archive and show the last message time and message count; group chats are excluded.
+
 ## Requirements
 
 - Go 1.25 or newer

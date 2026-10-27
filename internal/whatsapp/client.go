@@ -528,6 +528,13 @@ func (c *Client) ReplayRange(ctx context.Context, chatJID, fromDate, toDate stri
 	}
 }
 
+func (c *Client) ContactsContacted(ctx context.Context, from, until time.Time) ([]history.Contact, error) {
+	if c.archive == nil {
+		return nil, fmt.Errorf("local history archive is not ready")
+	}
+	return c.archive.ContactsContacted(ctx, from, until)
+}
+
 type olderHistoryResult struct {
 	ReachedStart bool
 	Detail       string
