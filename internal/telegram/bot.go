@@ -44,23 +44,24 @@ type ForwardedMessage struct {
 }
 
 type Bot struct {
-	token           string
-	ownerID         int64
-	selection       *selection.Store
-	chats           func() []Chat
-	refresh         func(context.Context) error
-	setSince        func(context.Context, string, string) (int, error)
-	replayRange     func(context.Context, string, string, string, history.ReplayProgress) (history.ReplayResult, error)
-	contactRange    func(context.Context, time.Time, time.Time) ([]history.Contact, error)
-	callRange       func(context.Context, time.Time, time.Time) ([]history.CallContact, error)
-	http            *http.Client
-	pendingJID      string
-	pendingPage     int
-	pendingRange    bool
-	pendingContacts bool
-	pendingFrom     string
-	historyMu       sync.Mutex
-	historyBusy     bool
+	token            string
+	ownerID          int64
+	selection        *selection.Store
+	chats            func() []Chat
+	refresh          func(context.Context) error
+	setSince         func(context.Context, string, string) (int, error)
+	replayRange      func(context.Context, string, string, string, history.ReplayProgress) (history.ReplayResult, error)
+	contactRange     func(context.Context, time.Time, time.Time) ([]history.Contact, error)
+	sentContactRange func(context.Context, time.Time, time.Time) ([]history.Contact, error)
+	callRange        func(context.Context, time.Time, time.Time) ([]history.CallContact, error)
+	http             *http.Client
+	pendingJID       string
+	pendingPage      int
+	pendingRange     bool
+	pendingContacts  bool
+	pendingFrom      string
+	historyMu        sync.Mutex
+	historyBusy      bool
 }
 
 type update struct {
@@ -105,18 +106,19 @@ type apiResponse struct {
 	} `json:"parameters"`
 }
 
-func New(token string, ownerID int64, store *selection.Store, chats func() []Chat, refresh func(context.Context) error, setSince func(context.Context, string, string) (int, error), replayRange func(context.Context, string, string, string, history.ReplayProgress) (history.ReplayResult, error), contactRange func(context.Context, time.Time, time.Time) ([]history.Contact, error), callRange func(context.Context, time.Time, time.Time) ([]history.CallContact, error)) *Bot {
+func New(token string, ownerID int64, store *selection.Store, chats func() []Chat, refresh func(context.Context) error, setSince func(context.Context, string, string) (int, error), replayRange func(context.Context, string, string, string, history.ReplayProgress) (history.ReplayResult, error), contactRange func(context.Context, time.Time, time.Time) ([]history.Contact, error), sentContactRange func(context.Context, time.Time, time.Time) ([]history.Contact, error), callRange func(context.Context, time.Time, time.Time) ([]history.CallContact, error)) *Bot {
 	return &Bot{
-		token:        token,
-		ownerID:      ownerID,
-		selection:    store,
-		chats:        chats,
-		refresh:      refresh,
-		setSince:     setSince,
-		replayRange:  replayRange,
-		contactRange: contactRange,
-		callRange:    callRange,
-		http:         &http.Client{Timeout: 65 * time.Second},
+		token:            token,
+		ownerID:          ownerID,
+		selection:        store,
+		chats:            chats,
+		refresh:          refresh,
+		setSince:         setSince,
+		replayRange:      replayRange,
+		contactRange:     contactRange,
+		sentContactRange: sentContactRange,
+		callRange:        callRange,
+		http:             &http.Client{Timeout: 65 * time.Second},
 	}
 }
 
@@ -359,7 +361,7 @@ func (b *Bot) handleUpdate(ctx context.Context, item update) {
 		}
 		switch strings.SplitN(command[0], "@", 2)[0] {
 		case "/start", "/help":
-			_ = b.sendText(ctx, b.ownerID, "WhatsApp bridge is ready. Use /chats to choose forwarding chats, or /contacts to see who messaged you today or during a date range.", inlineKeyboard{})
+			_ = b.sendText(ctx, b.ownerID, "WhatsApp bridge is ready. Use /chats to choose forwarding chats, or /contacts to see who messaged you, you messaged, or called during a date range.", inlineKeyboard{})
 		case "/chats":
 			if b.refresh != nil {
 				refreshCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
@@ -465,24 +467,30 @@ func (b *Bot) runContactReport(ctx context.Context, fromDate, toDate string) {
 	}
 	until := to.AddDate(0, 0, 1)
 	var contacts []history.Contact
+	var sentContacts []history.Contact
 	var calls []history.CallContact
-	var contactErr, callErr error
+	var contactErr, sentContactErr, callErr error
 	if b.contactRange != nil {
 		contacts, contactErr = b.contactRange(ctx, from, until)
 	} else {
 		contactErr = fmt.Errorf("message contact reports are unavailable")
+	}
+	if b.sentContactRange != nil {
+		sentContacts, sentContactErr = b.sentContactRange(ctx, from, until)
+	} else {
+		sentContactErr = fmt.Errorf("sent message contact reports are unavailable")
 	}
 	if b.callRange != nil {
 		calls, callErr = b.callRange(ctx, from, until)
 	} else {
 		callErr = fmt.Errorf("call history reports are unavailable")
 	}
-	if contactErr != nil && callErr != nil {
-		_ = b.sendText(ctx, b.ownerID, "Could not read the contact and call reports: "+contactErr.Error()+"; "+callErr.Error(), inlineKeyboard{})
+	if contactErr != nil && sentContactErr != nil && callErr != nil {
+		_ = b.sendText(ctx, b.ownerID, "Could not read the message and call reports: "+contactErr.Error()+"; "+sentContactErr.Error()+"; "+callErr.Error(), inlineKeyboard{})
 		return
 	}
 	var report strings.Builder
-	fmt.Fprintf(&report, "WhatsApp activity from %s through %s (Kenya time):\n", fromDate, toDate)
+	fmt.Fprintf(&report, "WhatsApp activity from %s through %s (Kenya time; checked %s):\n", fromDate, toDate, time.Now().In(timezone.Kenya).Format("2006-01-02 15:04"))
 	report.WriteString("\nPeople who messaged you:\n")
 	if contactErr != nil {
 		fmt.Fprintf(&report, "Could not read message contacts: %s\n", contactErr)
@@ -494,11 +502,22 @@ func (b *Bot) runContactReport(ctx context.Context, fromDate, toDate string) {
 			fmt.Fprintf(&report, "• %s — %d message(s), last %s\n", name, contact.MessageCount, contact.LastContact.In(timezone.Kenya).Format("2006-01-02 15:04"))
 		}
 	}
+	report.WriteString("\nPeople you messaged:\n")
+	if sentContactErr != nil {
+		fmt.Fprintf(&report, "Could not read sent message contacts: %s\n", sentContactErr)
+	} else if len(sentContacts) == 0 {
+		report.WriteString("No messages you sent to individual contacts were found in the local archive.\n")
+	} else {
+		for _, contact := range sentContacts {
+			name := strings.ReplaceAll(strings.ReplaceAll(contact.Name, "\r", " "), "\n", " ")
+			fmt.Fprintf(&report, "• %s — %d message(s), last %s\n", name, contact.MessageCount, contact.LastContact.In(timezone.Kenya).Format("2006-01-02 15:04"))
+		}
+	}
 	report.WriteString("\nPeople who called you:\n")
 	if callErr != nil {
 		fmt.Fprintf(&report, "Could not read call history: %s\n", callErr)
 	} else if len(calls) == 0 {
-		report.WriteString("No incoming individual calls were recorded in this range.\n")
+		report.WriteString("No incoming individual call records were synced from WhatsApp for this range.\n")
 	} else {
 		for _, call := range calls {
 			name := strings.ReplaceAll(strings.ReplaceAll(call.Name, "\r", " "), "\n", " ")
@@ -515,7 +534,7 @@ func (b *Bot) showContactOptions(ctx context.Context, chatID int64) {
 		{Text: "Today", CallbackData: "contacts_today"},
 		{Text: "Choose date range", CallbackData: "contacts_range"},
 	}}}
-	_ = b.sendText(ctx, chatID, "Show who sent you messages or called:", keyboard)
+	_ = b.sendText(ctx, chatID, "Show who messaged you, you messaged, or called:", keyboard)
 }
 
 func (b *Bot) runHistoryRange(ctx context.Context, jid, fromDate, toDate string, page int) {

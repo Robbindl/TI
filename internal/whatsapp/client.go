@@ -3,6 +3,7 @@ package whatsapp
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,8 +18,10 @@ import (
 	"github.com/local/wa-telegram-bridge/internal/timezone"
 	"github.com/mdp/qrterminal/v3"
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/appstate"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/proto/waHistorySync"
+	"go.mau.fi/whatsmeow/proto/waSyncAction"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -55,6 +58,8 @@ type Client struct {
 
 	historySyncEvents chan struct{}
 	historyRequestMu  sync.Mutex
+	callHistorySyncMu sync.Mutex
+	callHistorySynced bool
 
 	mu    sync.RWMutex
 	chats []Chat
@@ -96,6 +101,7 @@ func (c *Client) Run(ctx context.Context, onMessage func(Message) error, onConne
 		fmt.Println("Cleared the saved WhatsApp link; waiting for a fresh QR scan.")
 	}
 	client := whatsmeow.NewClient(device, logger)
+	client.EmitAppStateEventsOnFullSync = true
 	c.client = client
 	client.AddEventHandler(func(raw any) {
 		switch event := raw.(type) {
@@ -139,9 +145,16 @@ func (c *Client) Run(ctx context.Context, onMessage func(Message) error, onConne
 			c.forwardCall(ctx, chat, "WhatsApp call ended", onMessage)
 		case *events.CallReject:
 			c.updateCallStatus(ctx, event.CallID, "rejected")
+		case *events.AppState:
+			if event.CallLogAction != nil {
+				c.recordSyncedIncomingCall(ctx, event.CallLogAction.GetCallLogRecord(), event.Index)
+			}
 		case *events.HistorySync:
 			if event.Data == nil {
 				return
+			}
+			for _, call := range event.Data.GetCallLogRecords() {
+				c.recordSyncedIncomingCall(ctx, call, nil)
 			}
 			conversationCount := 0
 			archivedCount := 0
@@ -200,6 +213,7 @@ func (c *Client) Run(ctx context.Context, onMessage func(Message) error, onConne
 			}
 		case *events.Connected:
 			fmt.Println("WhatsApp connected.")
+			go c.syncCallHistory(ctx, client)
 			go func() {
 				refreshCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 				defer cancel()
@@ -559,6 +573,20 @@ func (c *Client) ContactsContacted(ctx context.Context, from, until time.Time) (
 	return contacts, nil
 }
 
+func (c *Client) ContactsMessagedByMe(ctx context.Context, from, until time.Time) ([]history.Contact, error) {
+	if c.archive == nil {
+		return nil, fmt.Errorf("local history archive is not ready")
+	}
+	contacts, err := c.archive.ContactsMessagedByMe(ctx, from, until)
+	if err != nil {
+		return nil, err
+	}
+	for i := range contacts {
+		contacts[i].Name = c.reportContactName(ctx, contacts[i].JID, contacts[i].Name)
+	}
+	return contacts, nil
+}
+
 func (c *Client) CallsContacted(ctx context.Context, from, until time.Time) ([]history.CallContact, error) {
 	if c.archive == nil {
 		return nil, fmt.Errorf("local call history is not ready")
@@ -609,6 +637,98 @@ func (c *Client) recordIncomingCall(ctx context.Context, callID string, caller t
 		CallID: callID, CallerJID: resolved.String(), CallerName: name, Timestamp: timestamp, Status: "offered",
 	}); err != nil {
 		fmt.Printf("Could not archive incoming WhatsApp call from %s: %v\n", resolved, err)
+	}
+}
+
+func (c *Client) syncCallHistory(ctx context.Context, client *whatsmeow.Client) {
+	c.callHistorySyncMu.Lock()
+	defer c.callHistorySyncMu.Unlock()
+	if c.callHistorySynced {
+		return
+	}
+	marker := filepath.Join("data", "call-history-sync.done")
+	if _, err := os.Stat(marker); err == nil {
+		c.callHistorySynced = true
+		return
+	} else if !os.IsNotExist(err) {
+		log.Printf("Could not check WhatsApp call history sync marker: %v", err)
+		return
+	}
+	syncCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
+	if err := client.FetchAppState(syncCtx, appstate.WAPatchRegular, true, false); err != nil {
+		log.Printf("Could not refresh WhatsApp call history: %v", err)
+		return
+	}
+	if err := os.WriteFile(marker, []byte(time.Now().UTC().Format(time.RFC3339)+"\n"), 0o600); err != nil {
+		log.Printf("WhatsApp call history was refreshed, but its completion marker could not be saved: %v", err)
+		return
+	}
+	c.callHistorySynced = true
+	log.Println("WhatsApp call history sync completed.")
+}
+
+func (c *Client) recordSyncedIncomingCall(ctx context.Context, record *waSyncAction.CallLogRecord, index []string) {
+	if c.archive == nil || record == nil {
+		return
+	}
+	if record.IsIncoming == nil || !record.GetIsIncoming() || record.GetGroupJID() != "" {
+		return
+	}
+	caller, err := types.ParseJID(record.GetCallCreatorJID())
+	if err != nil || !isPrivateChat(caller) {
+		return
+	}
+	startTime := record.GetStartTime()
+	if startTime <= 0 {
+		return
+	}
+	var timestamp time.Time
+	if startTime >= 1_000_000_000_000 {
+		timestamp = time.UnixMilli(startTime)
+	} else {
+		timestamp = time.Unix(startTime, 0)
+	}
+	callID := record.GetCallID()
+	if callID == "" && len(index) > 1 {
+		callID = index[len(index)-1]
+	}
+	if callID == "" {
+		callID = fmt.Sprintf("%s-%d", caller.String(), timestamp.UnixNano())
+	}
+	caller, name := c.resolveChat(ctx, caller, "")
+	status := syncedCallStatus(record.GetCallResult())
+	if err := c.archive.SaveIncomingCall(ctx, history.CallRecord{
+		CallID: callID, CallerJID: caller.String(), CallerName: name, Timestamp: timestamp, Status: status,
+	}); err != nil {
+		log.Printf("Could not archive synced WhatsApp call: %v", err)
+	}
+}
+
+func syncedCallStatus(result waSyncAction.CallLogRecord_CallResult) string {
+	switch result {
+	case waSyncAction.CallLogRecord_CONNECTED:
+		return "answered"
+	case waSyncAction.CallLogRecord_REJECTED:
+		return "rejected"
+	case waSyncAction.CallLogRecord_CANCELLED:
+		return "cancelled"
+	case waSyncAction.CallLogRecord_ACCEPTEDELSEWHERE:
+		return "answered elsewhere"
+	case waSyncAction.CallLogRecord_MISSED:
+		return "missed"
+	case waSyncAction.CallLogRecord_UNAVAILABLE:
+		return "unavailable"
+	case waSyncAction.CallLogRecord_UPCOMING:
+		return "upcoming"
+	case waSyncAction.CallLogRecord_FAILED:
+		return "failed"
+	case waSyncAction.CallLogRecord_ABANDONED:
+		return "abandoned"
+	case waSyncAction.CallLogRecord_ONGOING:
+		return "ongoing"
+	default:
+		return "unknown"
 	}
 }
 

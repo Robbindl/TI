@@ -277,29 +277,44 @@ func (a *Archive) CountRange(ctx context.Context, chatJID string, from, until ti
 }
 
 func (a *Archive) ContactsContacted(ctx context.Context, from, until time.Time) ([]Contact, error) {
+	return a.contactsByDirection(ctx, from, until, false)
+}
+
+func (a *Archive) ContactsMessagedByMe(ctx context.Context, from, until time.Time) ([]Contact, error) {
+	return a.contactsByDirection(ctx, from, until, true)
+}
+
+func (a *Archive) contactsByDirection(ctx context.Context, from, until time.Time, fromMe bool) ([]Contact, error) {
 	if !until.After(from) {
 		return nil, fmt.Errorf("contact report end must be later than its start")
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	nameExpr := `COALESCE(
+			NULLIF(CASE WHEN sender_name NOT IN ('', 'Unknown sender', 'Unknown chat', 'Unknown private chat') AND instr(sender_name, '@') = 0 THEN sender_name END, ''),
+			NULLIF(CASE WHEN chat_name NOT IN ('', 'Unknown chat', 'Unknown private chat') AND instr(chat_name, '@') = 0 THEN chat_name END, ''),
+			chat_jid
+		)`
+	if fromMe {
+		nameExpr = `COALESCE(
+			NULLIF(CASE WHEN chat_name NOT IN ('', 'Unknown chat', 'Unknown private chat') AND instr(chat_name, '@') = 0 THEN chat_name END, ''),
+			NULLIF(CASE WHEN sender_name NOT IN ('', 'Unknown sender', 'Unknown chat', 'Unknown private chat') AND instr(sender_name, '@') = 0 THEN sender_name END, ''),
+			chat_jid
+		)`
+	}
 	rows, err := a.db.QueryContext(ctx, `WITH ranked_contacts AS (
 		SELECT chat_jid,
-			COALESCE(
-				NULLIF(CASE WHEN sender_name NOT IN ('', 'Unknown sender', 'Unknown chat', 'Unknown private chat') AND instr(sender_name, '@') = 0 THEN sender_name END, ''),
-				NULLIF(CASE WHEN sender_name NOT IN ('', 'Unknown sender', 'Unknown chat', 'Unknown private chat') AND instr(sender_name, '@') = 0 THEN sender_name END, ''),
-				NULLIF(CASE WHEN chat_name NOT IN ('', 'Unknown chat', 'Unknown private chat') AND instr(chat_name, '@') = 0 THEN chat_name END, ''),
-				chat_jid
-			) AS contact_name,
+			`+nameExpr+` AS contact_name,
 			timestamp_unix,
 			COUNT(*) OVER (PARTITION BY chat_jid) AS message_count,
 			ROW_NUMBER() OVER (PARTITION BY chat_jid ORDER BY timestamp_unix DESC, message_id DESC) AS row_number
 		FROM message_history
-		WHERE from_me = 0 AND timestamp_unix >= ? AND timestamp_unix < ?
+		WHERE from_me = ? AND timestamp_unix >= ? AND timestamp_unix < ?
 			AND (chat_jid GLOB '*@s.whatsapp.net' OR chat_jid GLOB '*@lid' OR chat_jid GLOB '*@c.us')
 	)
 	SELECT chat_jid, contact_name, message_count, timestamp_unix
 	FROM ranked_contacts WHERE row_number = 1
-	ORDER BY timestamp_unix DESC, contact_name COLLATE NOCASE`, from.Unix(), until.Unix())
+	ORDER BY timestamp_unix DESC, contact_name COLLATE NOCASE`, fromMe, from.Unix(), until.Unix())
 	if err != nil {
 		return nil, err
 	}
@@ -332,7 +347,10 @@ func (a *Archive) SaveIncomingCall(ctx context.Context, call CallRecord) error {
 	_, err := a.db.ExecContext(ctx, `INSERT INTO call_history (call_id, caller_jid, caller_name, timestamp_unix, status)
 		VALUES (?, ?, ?, ?, ?)
 		ON CONFLICT(call_id) DO UPDATE SET
-		caller_name=CASE WHEN excluded.caller_name='' THEN call_history.caller_name ELSE excluded.caller_name END`,
+		caller_jid=excluded.caller_jid,
+		caller_name=CASE WHEN excluded.caller_name='' THEN call_history.caller_name ELSE excluded.caller_name END,
+		timestamp_unix=excluded.timestamp_unix,
+		status=excluded.status`,
 		call.CallID, call.CallerJID, call.CallerName, call.Timestamp.Unix(), call.Status)
 	return err
 }
