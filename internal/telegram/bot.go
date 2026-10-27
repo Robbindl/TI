@@ -31,14 +31,15 @@ type Chat struct {
 }
 
 type ForwardedMessage struct {
-	Chat      string
-	Sender    string
-	Timestamp string
-	Text      string
-	MediaKind string
-	MediaName string
-	MediaMIME string
-	MediaData []byte
+	Chat       string
+	Sender     string
+	Timestamp  string
+	Text       string
+	MediaKind  string
+	MediaName  string
+	MediaMIME  string
+	MediaData  []byte
+	IsViewOnce bool
 }
 
 type Bot struct {
@@ -152,6 +153,9 @@ func (b *Bot) SendForwarded(ctx context.Context, message ForwardedMessage) error
 	caption := message.Chat + "\n" + message.Timestamp + "\n" + message.Sender
 	if strings.TrimSpace(message.Text) != "" {
 		caption += ": " + message.Text
+	}
+	if message.IsViewOnce {
+		caption += "\n[WhatsApp view-once; Telegram copy does not expire]"
 	}
 	if len(message.MediaData) == 0 || message.MediaKind == "" {
 		return b.sendLongText(ctx, caption)

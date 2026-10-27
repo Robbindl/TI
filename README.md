@@ -4,7 +4,7 @@ A local Go service that links one WhatsApp account with a terminal QR code and f
 
 ## Important
 
-WhatsApp connectivity is provided by the unofficial `whatsmeow` library, not the WhatsApp Business Platform. It may violate WhatsApp's terms, break when WhatsApp changes its protocol, or lead to the linked account being restricted. Use only an account and conversations you are authorized to access, and consider the privacy of everyone whose messages may be forwarded. The bridge does not forward view-once messages. It forwards text and supported media in both directions of the conversation (messages you send and messages you receive) to Telegram, but it does not send Telegram messages back to WhatsApp.
+WhatsApp connectivity is provided by the unofficial `whatsmeow` library, not the WhatsApp Business Platform. It may violate WhatsApp's terms, break when WhatsApp changes its protocol, or lead to the linked account being restricted. Use only an account and conversations you are authorized to access, and consider the privacy of everyone whose messages may be forwarded. The bridge forwards supported text and media, including view-once photos and videos, from enabled chats to your Telegram bot. View-once media is labeled in Telegram and is not saved in the local history archive; its Telegram copy is an ordinary file and does not expire. The bridge does not send Telegram messages back to WhatsApp.
 
 The WhatsApp linked-device session is stored in `data/whatsapp.db`. Synced text and captions are archived locally in `data/message-history.db` so date-based replay can work after WhatsApp's sync has completed. Treat both databases as sensitive. The Telegram bot token and owner ID are read from environment variables, not files in the repository.
 

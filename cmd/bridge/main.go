@@ -106,5 +106,6 @@ func formatForwardedMessage(message whatsapp.Message) telegram.ForwardedMessage 
 	return telegram.ForwardedMessage{
 		Chat: message.Chat, Sender: message.Sender, Timestamp: stamp, Text: message.Text,
 		MediaKind: message.MediaKind, MediaName: message.MediaName, MediaMIME: message.MediaMIME, MediaData: message.MediaData,
+		IsViewOnce: message.IsViewOnce,
 	}
 }

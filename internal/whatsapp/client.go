@@ -32,18 +32,19 @@ type Chat struct {
 }
 
 type Message struct {
-	ChatJID   string
-	MessageID string
-	SenderJID string
-	Timestamp time.Time
-	Chat      string
-	Sender    string
-	Text      string
-	FromMe    bool
-	MediaKind string
-	MediaName string
-	MediaMIME string
-	MediaData []byte
+	ChatJID    string
+	MessageID  string
+	SenderJID  string
+	Timestamp  time.Time
+	Chat       string
+	Sender     string
+	Text       string
+	FromMe     bool
+	MediaKind  string
+	MediaName  string
+	MediaMIME  string
+	MediaData  []byte
+	IsViewOnce bool
 }
 
 type Client struct {
@@ -198,9 +199,6 @@ func (c *Client) Run(ctx context.Context, onMessage func(Message) error, onConne
 			if event.Info.Chat.IsEmpty() {
 				return
 			}
-			if event.IsViewOnce {
-				return
-			}
 			chat, name := c.resolveChat(ctx, event.Info.Chat, event.Info.PushName)
 			chatJID := chat.String()
 			if isPrivateChat(event.Info.Chat) {
@@ -216,13 +214,15 @@ func (c *Client) Run(ctx context.Context, onMessage func(Message) error, onConne
 			}
 			message := Message{
 				ChatJID: chatJID, MessageID: event.Info.ID, SenderJID: event.Info.Sender.String(),
-				Timestamp: event.Info.Timestamp, Chat: name, Sender: sender, Text: text, FromMe: event.Info.IsFromMe,
+				Timestamp: event.Info.Timestamp, Chat: name, Sender: sender, Text: text, FromMe: event.Info.IsFromMe, IsViewOnce: event.IsViewOnce,
 			}
-			if err := archive.Save(ctx, history.Message{
-				ChatJID: message.ChatJID, RequestChatJID: event.Info.Chat.String(), MessageID: message.MessageID, SenderJID: message.SenderJID,
-				Timestamp: message.Timestamp, Chat: message.Chat, Sender: message.Sender, Text: message.Text, FromMe: message.FromMe,
-			}); err != nil {
-				fmt.Printf("Could not archive WhatsApp message from %s: %v\n", chatJID, err)
+			if !message.IsViewOnce {
+				if err := archive.Save(ctx, history.Message{
+					ChatJID: message.ChatJID, RequestChatJID: event.Info.Chat.String(), MessageID: message.MessageID, SenderJID: message.SenderJID,
+					Timestamp: message.Timestamp, Chat: message.Chat, Sender: message.Sender, Text: message.Text, FromMe: message.FromMe,
+				}); err != nil {
+					fmt.Printf("Could not archive WhatsApp message from %s: %v\n", chatJID, err)
+				}
 			}
 			if onMessage != nil {
 				enabled, allowed := c.shouldForward(message)
@@ -246,7 +246,7 @@ func (c *Client) Run(ctx context.Context, onMessage func(Message) error, onConne
 							message.MediaName = mediaFileName(mediaKind, message.MediaMIME)
 						}
 					}
-					if message.MediaKind != "" {
+					if message.MediaKind != "" && !message.IsViewOnce {
 						if err := archive.Save(ctx, history.Message{
 							ChatJID: message.ChatJID, MessageID: message.MessageID, SenderJID: message.SenderJID,
 							Timestamp: message.Timestamp, Chat: message.Chat, Sender: message.Sender, Text: message.Text, FromMe: message.FromMe,
@@ -257,8 +257,10 @@ func (c *Client) Run(ctx context.Context, onMessage func(Message) error, onConne
 					}
 					if err := onMessage(message); err != nil {
 						fmt.Printf("Could not forward live message from %s: %v\n", chatJID, err)
-					} else if err := archive.MarkForwarded(ctx, history.Message{ChatJID: message.ChatJID, MessageID: message.MessageID, SenderJID: message.SenderJID}); err != nil {
-						fmt.Printf("Could not record forwarded message from %s: %v\n", chatJID, err)
+					} else if !message.IsViewOnce {
+						if err := archive.MarkForwarded(ctx, history.Message{ChatJID: message.ChatJID, MessageID: message.MessageID, SenderJID: message.SenderJID}); err != nil {
+							fmt.Printf("Could not record forwarded message from %s: %v\n", chatJID, err)
+						}
 					}
 				}
 			}
