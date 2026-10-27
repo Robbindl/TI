@@ -44,6 +44,22 @@ type Contact struct {
 	LastContact  time.Time
 }
 
+type CallRecord struct {
+	CallID     string
+	CallerJID  string
+	CallerName string
+	Timestamp  time.Time
+	Status     string
+}
+
+type CallContact struct {
+	JID       string
+	Name      string
+	CallCount int
+	LastCall  time.Time
+	LastState string
+}
+
 type Archive struct {
 	mu sync.Mutex
 	db *sql.DB
@@ -92,6 +108,20 @@ func Open(path string) (*Archive, error) {
 		}
 	}
 	if _, err = db.Exec(`CREATE INDEX IF NOT EXISTS message_history_date ON message_history(chat_jid, timestamp_unix)`); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if _, err = db.Exec(`CREATE TABLE IF NOT EXISTS call_history (
+		call_id TEXT PRIMARY KEY,
+		caller_jid TEXT NOT NULL,
+		caller_name TEXT NOT NULL,
+		timestamp_unix INTEGER NOT NULL,
+		status TEXT NOT NULL DEFAULT 'offered'
+	)`); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if _, err = db.Exec(`CREATE INDEX IF NOT EXISTS call_history_date ON call_history(timestamp_unix)`); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -285,6 +315,76 @@ func (a *Archive) ContactsContacted(ctx context.Context, from, until time.Time) 
 		contacts = append(contacts, contact)
 	}
 	return contacts, rows.Err()
+}
+
+func (a *Archive) SaveIncomingCall(ctx context.Context, call CallRecord) error {
+	if call.CallID == "" || call.CallerJID == "" || call.Timestamp.IsZero() {
+		return fmt.Errorf("call ID, caller, and timestamp are required")
+	}
+	if call.CallerName == "" {
+		call.CallerName = call.CallerJID
+	}
+	if call.Status == "" {
+		call.Status = "offered"
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	_, err := a.db.ExecContext(ctx, `INSERT INTO call_history (call_id, caller_jid, caller_name, timestamp_unix, status)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(call_id) DO UPDATE SET
+		caller_name=CASE WHEN excluded.caller_name='' THEN call_history.caller_name ELSE excluded.caller_name END`,
+		call.CallID, call.CallerJID, call.CallerName, call.Timestamp.Unix(), call.Status)
+	return err
+}
+
+func (a *Archive) UpdateCallStatus(ctx context.Context, callID, status string) error {
+	if callID == "" || status == "" {
+		return nil
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	_, err := a.db.ExecContext(ctx, `UPDATE call_history SET status = ? WHERE call_id = ?`, status, callID)
+	return err
+}
+
+func (a *Archive) CallsContacted(ctx context.Context, from, until time.Time) ([]CallContact, error) {
+	if !until.After(from) {
+		return nil, fmt.Errorf("call report end must be later than its start")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	rows, err := a.db.QueryContext(ctx, `WITH ranked_calls AS (
+		SELECT caller_jid,
+			COALESCE(
+				NULLIF(CASE WHEN caller_name NOT IN ('', 'Unknown chat', 'Unknown private chat', 'Unknown sender') AND instr(caller_name, '@') = 0 THEN caller_name END, ''),
+				caller_jid
+			) AS caller_name,
+			timestamp_unix,
+			status,
+			COUNT(*) OVER (PARTITION BY caller_jid) AS call_count,
+			ROW_NUMBER() OVER (PARTITION BY caller_jid ORDER BY timestamp_unix DESC, call_id DESC) AS row_number
+		FROM call_history
+		WHERE timestamp_unix >= ? AND timestamp_unix < ?
+			AND (caller_jid GLOB '*@s.whatsapp.net' OR caller_jid GLOB '*@lid' OR caller_jid GLOB '*@c.us')
+	)
+	SELECT caller_jid, caller_name, call_count, timestamp_unix, status
+	FROM ranked_calls WHERE row_number = 1
+	ORDER BY timestamp_unix DESC, caller_name COLLATE NOCASE`, from.Unix(), until.Unix())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var callers []CallContact
+	for rows.Next() {
+		var caller CallContact
+		var lastCall int64
+		if err := rows.Scan(&caller.JID, &caller.Name, &caller.CallCount, &lastCall, &caller.LastState); err != nil {
+			return nil, err
+		}
+		caller.LastCall = time.Unix(lastCall, 0)
+		callers = append(callers, caller)
+	}
+	return callers, rows.Err()
 }
 
 func (a *Archive) Oldest(ctx context.Context, chatJID string) (Message, bool, error) {

@@ -8,7 +8,7 @@ WhatsApp connectivity is provided by the unofficial `whatsmeow` library, not the
 
 The WhatsApp linked-device session is stored in `data/whatsapp.db`. Synced text and captions are archived locally in `data/message-history.db` so date-based replay can work after WhatsApp's sync has completed. Treat both databases as sensitive. The Telegram bot token and owner ID are read from environment variables, not files in the repository.
 
-Use `/contacts` or the buttons in `/chats` to list individual WhatsApp contacts who sent incoming messages today or during an inclusive date range. Reports use messages currently present in the local archive, resolve names from WhatsApp contact details when available, and show the last message time and message count; group chats are excluded. Contact report dates and times use the Africa/Nairobi timezone, regardless of the PC timezone.
+Use `/contacts` or the buttons in `/chats` to list individual WhatsApp contacts who sent incoming messages or called today or during an inclusive date range. Reports use messages and call events saved in the local archive, resolve names from WhatsApp contact details when available, and show counts, last activity times, and the latest call status; group chats are excluded. Contact report dates and times use the Africa/Nairobi timezone, regardless of the PC timezone. Call history is collected from the time this feature is installed; older calls cannot be reconstructed.
 
 ## Requirements
 
@@ -101,6 +101,7 @@ Manage the service with:
 - Incoming and outgoing WhatsApp text/captions forwarded to the owner's Telegram private chat
 - Images, videos, voice notes, audio, stickers, and documents uploaded to Telegram when within the Bot API upload limit
 - WhatsApp call offers, group-call notices, acceptances, and terminations sent as notifications for enabled chats
+- Incoming one-to-one call events stored locally and included in `/contacts` reports; call audio is not currently recorded
 - Synced text/caption history stored in `data/message-history.db` and replayed from the selected date
 - Telegram-to-WhatsApp message sending is not implemented
-- View-once content is ignored
+- View-once photos and videos are forwarded with a label; the Telegram copy is a regular file and does not expire

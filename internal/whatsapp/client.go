@@ -100,12 +100,16 @@ func (c *Client) Run(ctx context.Context, onMessage func(Message) error, onConne
 	client.AddEventHandler(func(raw any) {
 		switch event := raw.(type) {
 		case *events.CallOffer:
+			if event.GroupJID.IsEmpty() {
+				c.recordIncomingCall(ctx, event.CallID, event.From, event.Timestamp)
+			}
 			chat := event.From
 			if !event.GroupJID.IsEmpty() {
 				chat = event.GroupJID
 			}
 			c.forwardCall(ctx, chat, "Incoming WhatsApp call", onMessage)
 		case *events.CallAccept:
+			c.updateCallStatus(ctx, event.CallID, "accepted")
 			chat := event.From
 			if !event.GroupJID.IsEmpty() {
 				chat = event.GroupJID
@@ -118,11 +122,23 @@ func (c *Client) Run(ctx context.Context, onMessage func(Message) error, onConne
 			}
 			c.forwardCall(ctx, chat, "Incoming WhatsApp "+firstNonBlank(event.Media, "voice")+" group call", onMessage)
 		case *events.CallTerminate:
+			status := "ended"
+			switch event.Reason {
+			case "timeout":
+				status = "missed"
+			case "accepted_elsewhere":
+				status = "answered elsewhere"
+			case "rejected_elsewhere":
+				status = "rejected elsewhere"
+			}
+			c.updateCallStatus(ctx, event.CallID, status)
 			chat := event.From
 			if !event.GroupJID.IsEmpty() {
 				chat = event.GroupJID
 			}
 			c.forwardCall(ctx, chat, "WhatsApp call ended", onMessage)
+		case *events.CallReject:
+			c.updateCallStatus(ctx, event.CallID, "rejected")
 		case *events.HistorySync:
 			if event.Data == nil {
 				return
@@ -538,27 +554,71 @@ func (c *Client) ContactsContacted(ctx context.Context, from, until time.Time) (
 		return nil, err
 	}
 	for i := range contacts {
-		jid, err := types.ParseJID(contacts[i].JID)
-		if err != nil {
-			continue
-		}
-		resolved, liveName := c.resolveChat(ctx, jid, "")
-		if isUsableContactName(liveName, resolved) {
-			contacts[i].Name = liveName
-			continue
-		}
-		if isUsableContactName(contacts[i].Name, resolved) {
-			continue
-		}
-		if resolved.Server == types.HiddenUserServer {
-			contacts[i].Name = "WhatsApp contact (name unavailable)"
-		} else if resolved.User != "" {
-			contacts[i].Name = resolved.User
-		} else {
-			contacts[i].Name = contacts[i].JID
-		}
+		contacts[i].Name = c.reportContactName(ctx, contacts[i].JID, contacts[i].Name)
 	}
 	return contacts, nil
+}
+
+func (c *Client) CallsContacted(ctx context.Context, from, until time.Time) ([]history.CallContact, error) {
+	if c.archive == nil {
+		return nil, fmt.Errorf("local call history is not ready")
+	}
+	callers, err := c.archive.CallsContacted(ctx, from, until)
+	if err != nil {
+		return nil, err
+	}
+	for i := range callers {
+		callers[i].Name = c.reportContactName(ctx, callers[i].JID, callers[i].Name)
+	}
+	return callers, nil
+}
+
+func (c *Client) reportContactName(ctx context.Context, jidString, archivedName string) string {
+	jid, err := types.ParseJID(jidString)
+	if err != nil {
+		return archivedName
+	}
+	resolved, liveName := c.resolveChat(ctx, jid, "")
+	if isUsableContactName(liveName, resolved) {
+		return liveName
+	}
+	if isUsableContactName(archivedName, resolved) {
+		return archivedName
+	}
+	if resolved.Server == types.HiddenUserServer {
+		return "WhatsApp contact (name unavailable)"
+	}
+	if resolved.User != "" {
+		return resolved.User
+	}
+	return jidString
+}
+
+func (c *Client) recordIncomingCall(ctx context.Context, callID string, caller types.JID, timestamp time.Time) {
+	if c.archive == nil || caller.IsEmpty() {
+		return
+	}
+	resolved, name := c.resolveChat(ctx, caller, "")
+	if timestamp.IsZero() {
+		timestamp = time.Now()
+	}
+	if callID == "" {
+		callID = fmt.Sprintf("%s-%d", resolved.String(), timestamp.UnixNano())
+	}
+	if err := c.archive.SaveIncomingCall(ctx, history.CallRecord{
+		CallID: callID, CallerJID: resolved.String(), CallerName: name, Timestamp: timestamp, Status: "offered",
+	}); err != nil {
+		fmt.Printf("Could not archive incoming WhatsApp call from %s: %v\n", resolved, err)
+	}
+}
+
+func (c *Client) updateCallStatus(ctx context.Context, callID, status string) {
+	if c.archive == nil {
+		return
+	}
+	if err := c.archive.UpdateCallStatus(ctx, callID, status); err != nil {
+		fmt.Printf("Could not update WhatsApp call history: %v\n", err)
+	}
 }
 
 type olderHistoryResult struct {
